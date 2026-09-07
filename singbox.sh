@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="20"
+export SCRIPT_VERSION="21"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -2121,15 +2121,9 @@ _initialize_config_files() {
   "dns": {
     "servers": [
       {
+        "type": "local",
         "tag": "dns-local",
-        "address": "local",
-        "detour": "direct"
-      }
-    ],
-    "rules": [
-      {
-        "outbound": "any",
-        "server": "dns-local"
+        "prefer_go": true
       }
     ],
     "strategy": "prefer_ipv4"
@@ -2143,7 +2137,10 @@ _initialize_config_files() {
   ],
   "route": {
     "rules": [],
-    "final": "direct"
+    "final": "direct",
+    "default_domain_resolver": {
+      "server": "dns-local"
+    }
   }
 }
 EOF
@@ -2297,34 +2294,110 @@ _cleanup_legacy_config() {
     return 1
 }
 
+# 将旧版 DNS address 字符串转换为 sing-box 1.12+ 类型化 DNS 服务器 JSON
+# 用法: _dns_address_to_server_json <address> [tag]，失败返回非 0
+_dns_address_to_server_json() {
+    local address="$1"
+    local tag="${2:-dns-local}"
+    local scheme="" rest="" hostport="" host="" port="" path=""
+
+    case "$address" in
+        ""|local)
+            jq -n --arg tag "$tag" '{type:"local", tag:$tag, prefer_go:true}'
+            return 0 ;;
+        *"://"*)
+            scheme="${address%%://*}"
+            rest="${address#*://}" ;;
+        *)
+            scheme="udp"
+            rest="$address" ;;
+    esac
+
+    hostport="${rest%%/*}"
+    [[ "$rest" == */* ]] && path="/${rest#*/}"
+
+    if [[ "$hostport" == \[*\]* ]]; then
+        host="${hostport%%]*}"; host="${host#[}"
+        port="${hostport##*]}"; port="${port#:}"
+    elif [[ "$hostport" == *:* ]]; then
+        host="${hostport%%:*}"
+        port="${hostport##*:}"
+    else
+        host="$hostport"
+    fi
+    [ -z "$host" ] && return 1
+    [[ "$port" =~ ^[0-9]+$ ]] || port=""
+
+    local type=""
+    case "$scheme" in
+        udp|tcp|tls|quic) type="$scheme" ;;
+        https|h3) type="https" ;;
+        *) return 1 ;;
+    esac
+
+    local jq_args=(--arg type "$type" --arg tag "$tag" --arg server "$host")
+    local jq_filter='{type:$type, tag:$tag, server:$server}'
+    if [ -n "$port" ]; then
+        jq_args+=(--argjson port "$port")
+        jq_filter+=' + {server_port:$port}'
+    fi
+    if [ "$type" = "https" ] && [ -n "$path" ] && [ "$path" != "/dns-query" ]; then
+        jq_args+=(--arg path "$path")
+        jq_filter+=' + {path:$path}'
+    fi
+    jq -n "${jq_args[@]}" "$jq_filter"
+}
+
 _check_and_fix_dns() {
     # 热修复：1.补充缺失的 DNS 模块，2.将容易引起出站路由绑定死循环（连接被秒重置）的 auto_detect_interface 清除
     # 3. 为未设置策略的旧配置补充 prefer_ipv4；保留用户在 DNS 菜单中明确选择的策略
-    if [ ! -f "$CONFIG_FILE" ]; then return; fi
-    
+    # 4. [sing-box 1.14 适配] 旧版 address 型 DNS 服务器已在 1.14 移除：
+    #    自动迁移为类型化服务器，删除已移除的 {"outbound":"any"} DNS 规则，
+    #    并补充 route.default_domain_resolver
+    if [ ! -f "$CONFIG_FILE" ]; then return 1; fi
+
     local has_dns=$(jq 'has("dns")' "$CONFIG_FILE" 2>/dev/null)
     local has_auto_detect=$(jq 'try .route.auto_detect_interface catch false' "$CONFIG_FILE" 2>/dev/null)
     local dns_strategy=$(jq -r '.dns.strategy // ""' "$CONFIG_FILE" 2>/dev/null)
+    local legacy_dns=$(jq '[(.dns.servers // [])[] | has("address")] | any' "$CONFIG_FILE" 2>/dev/null)
+    local legacy_rules=$(jq '[(.dns.rules // [])[] | has("outbound")] | any' "$CONFIG_FILE" 2>/dev/null)
+    local has_resolver=$(jq '(.route // {}) | has("default_domain_resolver")' "$CONFIG_FILE" 2>/dev/null)
     local needs_restart=false
-    
-    if [ "$has_dns" == "false" ] || [ "$has_auto_detect" == "true" ] || [ -z "$dns_strategy" ]; then
+
+    if [ "$has_dns" == "false" ] || [ "$has_auto_detect" == "true" ] || [ -z "$dns_strategy" ] \
+        || [ "$legacy_dns" == "true" ] || [ "$legacy_rules" == "true" ] || [ "$has_resolver" != "true" ]; then
         _warn "检测到 DNS/路由配置需要兼容性修复，正在自动处理..."
-        
+
+        # 迁移时保留旧配置中的 DNS 地址；无法识别时回退为系统 DNS
+        local replace_servers="true"
+        local server_json=""
+        if [ "$legacy_dns" == "true" ]; then
+            local old_address=$(jq -r '.dns.servers[0].address // ""' "$CONFIG_FILE" 2>/dev/null)
+            server_json=$(_dns_address_to_server_json "$old_address" "dns-local" 2>/dev/null)
+        elif [ "$has_dns" == "true" ] && jq -e '(.dns.servers // []) | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
+            # 已是类型化服务器，保留原样
+            replace_servers="false"
+        fi
+        [ -z "$server_json" ] && server_json='{"type":"local","tag":"dns-local","prefer_go":true}'
+
+        local resolver_tag="dns-local"
+        if [ "$replace_servers" == "false" ]; then
+            resolver_tag=$(jq -r '.dns.servers[0].tag // "dns-local"' "$CONFIG_FILE" 2>/dev/null)
+        fi
+
         local tmp_file="${CONFIG_FILE}.tmp"
-        jq '
-            if has("dns") then . else . + {
-                "dns": {
-                    "servers": [
-                        {"tag": "dns-local", "address": "local", "detour": "direct"}
-                    ],
-                    "rules": [{"outbound": "any", "server": "dns-local"}],
-                    "strategy": "prefer_ipv4"
-                }
-            } end
-            | if ((.dns.strategy // "") == "") then .dns.strategy = "prefer_ipv4" else . end
+        jq --argjson server "$server_json" --arg rtag "$resolver_tag" \
+           --argjson replace "$( [ "$replace_servers" == "true" ] && echo true || echo false )" '
+            .dns = (.dns // {})
+            | .dns.servers = (if $replace then [$server] else .dns.servers end)
+            | .dns.rules = ([(.dns.rules // [])[] | select(has("outbound") | not)])
+            | (if (.dns.rules | length) == 0 then del(.dns.rules) else . end)
+            | .dns.strategy = (if ((.dns.strategy // "") == "") then "prefer_ipv4" else .dns.strategy end)
+            | .route = (.route // {})
+            | .route.default_domain_resolver = {"server": $rtag}
             | del(.route.auto_detect_interface)
         ' "$CONFIG_FILE" > "$tmp_file"
-        
+
         if [ $? -eq 0 ] && [ -s "$tmp_file" ]; then
             mv "$tmp_file" "$CONFIG_FILE"
             _success "DNS 与路由参数热修复完成！"
@@ -4453,23 +4526,21 @@ _apply_dns_config() {
     local backup_file="${CONFIG_FILE}.bak_dns_$(date +%Y%m%d_%H%M%S)"
     local check_result
 
-    if ! jq --arg address "$dns_address" --arg strategy "$dns_strategy" '
+    # [sing-box 1.14 适配] 使用类型化 DNS 服务器格式
+    local server_json
+    server_json=$(_dns_address_to_server_json "$dns_address" "dns-local")
+    if [ $? -ne 0 ] || [ -z "$server_json" ]; then
+        _error "无法识别的 DNS 地址格式：${dns_address}"
+        return 1
+    fi
+
+    if ! jq --argjson server "$server_json" --arg strategy "$dns_strategy" '
         .dns = {
-            "servers": [
-                {
-                    "tag": "dns-local",
-                    "address": $address,
-                    "detour": "direct"
-                }
-            ],
-            "rules": [
-                {
-                    "outbound": "any",
-                    "server": "dns-local"
-                }
-            ],
+            "servers": [$server],
             "strategy": $strategy
         }
+        | .route = (.route // {})
+        | .route.default_domain_resolver = {"server": "dns-local"}
     ' "$CONFIG_FILE" > "$tmp_file"; then
         _error "生成 DNS 配置失败。"
         rm -f "$tmp_file"
@@ -4498,7 +4569,14 @@ _dns_config_menu() {
     local current_address current_strategy choice dns_address dns_strategy
 
     while true; do
-        current_address=$(jq -r '.dns.servers[0].address // "未设置"' "$CONFIG_FILE" 2>/dev/null)
+        current_address=$(jq -r '
+            (.dns.servers[0] // {}) |
+            if has("address") then .address
+            elif .type == "local" then "local"
+            elif .type == "https" then "https://\(.server)\(.path // "/dns-query")"
+            elif .type != null then "\(.type)://\(.server)\(if .server_port then ":\(.server_port)" else "" end)"
+            else "未设置" end
+        ' "$CONFIG_FILE" 2>/dev/null)
         current_strategy=$(jq -r '.dns.strategy // "prefer_ipv4"' "$CONFIG_FILE" 2>/dev/null)
         [ -z "$current_address" ] || [ "$current_address" = "null" ] && current_address="未设置"
         [ -z "$current_strategy" ] || [ "$current_strategy" = "null" ] && current_strategy="prefer_ipv4"

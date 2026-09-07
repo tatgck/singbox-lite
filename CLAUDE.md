@@ -103,6 +103,14 @@ The `parser.sh` SS link parser was rewritten with:
 
 **Location**: `parser.sh:201-287`
 
+### 3. sing-box 1.14 DNS Format Migration
+sing-box 1.14 removed legacy DNS server formats (`address` field) and the `{"outbound":"any"}` DNS rule, causing `FATAL decode config ... dns.servers[0]` on startup. Fixed in `singbox.sh`:
+- New configs use typed DNS servers (`{"type":"local","tag":"dns-local","prefer_go":true}`) plus `route.default_domain_resolver` instead of the removed outbound-any DNS rule
+- `_dns_address_to_server_json()` converts legacy address strings (`local`, bare IP, `udp://`, `tcp://`, `tls://`, `quic://`, `https://host/path`) to typed server JSON
+- `_check_and_fix_dns()` auto-migrates existing legacy configs on script start (idempotent; preserves the user's chosen DNS address and strategy)
+- `_apply_dns_config()` (DNS menu) writes typed format; menu display reconstructs a readable address from typed servers
+- The `ENABLE_DEPRECATED_*` env vars still exported by scripts/service files are inert on 1.14 (harmless)
+
 ## Common Development Tasks
 
 ### Testing SS Link Parsing
