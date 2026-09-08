@@ -1471,6 +1471,159 @@ _modify_relay_port() {
     read -p "  按回车键继续..."
 }
 
+_modify_relay_sni() {
+    echo -e "\n  ${CYAN}【修改中转入口 SNI】${NC}"
+
+    local CONFIG_FILE="$RELAY_CONFIG_FILE"
+    local rules=$(jq -c '.route.rules[] | select(.inbound != null and .outbound != null)' "$CONFIG_FILE" 2>/dev/null)
+
+    if [ -z "$rules" ]; then
+        _warn "没有可修改的中转路由。"
+        return
+    fi
+
+    local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
+    local i=1; local rule_list=()
+    while IFS= read -r rule; do
+        local in_tag=$(echo "$rule" | jq -r '.inbound')
+        local inbound=$(jq -c --arg t "$in_tag" '.inbounds[] | select(.tag == $t)' "$CONFIG_FILE")
+        local port=$(echo "$inbound" | jq -r '.listen_port')
+        local cur_sni=$(echo "$inbound" | jq -r '.tls.server_name // "无"')
+        local node_name="" landing=""
+        if [ -f "$LINKS_FILE" ]; then
+            node_name=$(jq -r --arg t "$in_tag" '.[$t].node_name // ""' "$LINKS_FILE" 2>/dev/null)
+            landing=$(jq -r --arg t "$in_tag" '.[$t].landing_addr // ""' "$LINKS_FILE" 2>/dev/null)
+        fi
+        echo -e "    ${GREEN}[$i]${NC} ${node_name:-$in_tag} | 端口: ${port} | SNI: ${CYAN}${cur_sni}${NC} | 落地: ${landing:-未知}"
+        rule_list+=("$rule")
+        ((i++))
+    done <<< "$rules"
+
+    echo ""
+    read -p "  请输入要修改 SNI 的序号: " choice
+    if ! [[ "$choice" =~ ^[1-9][0-9]*$ ]] || [ "$choice" -ge "$i" ]; then return; fi
+
+    local selected_rule=${rule_list[$((choice-1))]}
+    local in_tag=$(echo "$selected_rule" | jq -r '.inbound')
+    local inbound_json=$(jq -c --arg t "$in_tag" '.inbounds[] | select(.tag == $t)' "$CONFIG_FILE")
+    local relay_type=$(echo "$inbound_json" | jq -r '.type')
+    local old_sni=$(echo "$inbound_json" | jq -r '.tls.server_name // ""')
+    local is_reality=$(echo "$inbound_json" | jq -r '.tls.reality.enabled // false')
+
+    if [ -z "$old_sni" ]; then
+        _warn "该中转入口不含 TLS SNI，无法修改。"
+        return
+    fi
+
+    _info "当前入口: ${in_tag} (${relay_type})"
+    _info "当前 SNI: ${old_sni}"
+    if [ "$is_reality" == "true" ]; then
+        _info "Reality 入口：新 SNI 必须是支持 TLS 1.3 + HTTP/2 且直连可访问的真实域名（可用主菜单 [20] SNI 优选测试）。"
+    fi
+
+    read -p "  请输入新的 SNI 域名: " new_sni
+    new_sni=$(echo "$new_sni" | xargs)
+    if [ -z "$new_sni" ]; then _warn "输入为空，已取消。"; return; fi
+    if ! [[ "$new_sni" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then
+        _error "SNI 域名格式无效！"
+        return
+    fi
+    if [ "$new_sni" == "$old_sni" ]; then _warn "新 SNI 与当前相同，无需修改。"; return; fi
+
+    _info "正在修改 SNI: ${old_sni} -> ${new_sni}"
+
+    # 备份，任一步失败可回滚
+    local backup_file="${CONFIG_FILE}.bak_sni_$$"
+    cp "$CONFIG_FILE" "$backup_file"
+    local cert_path="${RELAY_AUX_DIR}/${in_tag}.pem"
+    local key_path="${RELAY_AUX_DIR}/${in_tag}.key"
+    local has_cert="false"
+    if [ "$is_reality" != "true" ] && [ -f "$cert_path" ]; then
+        has_cert="true"
+        cp "$cert_path" "${cert_path}.bak_sni" 2>/dev/null
+        cp "$key_path" "${key_path}.bak_sni" 2>/dev/null
+    fi
+
+    _rollback_relay_sni() {
+        mv "$backup_file" "$CONFIG_FILE" 2>/dev/null
+        if [ "$has_cert" == "true" ]; then
+            [ -f "${cert_path}.bak_sni" ] && mv "${cert_path}.bak_sni" "$cert_path"
+            [ -f "${key_path}.bak_sni" ] && mv "${key_path}.bak_sni" "$key_path"
+        fi
+    }
+
+    # 1. relay.json 更新 server_name（Reality 同步 handshake.server）
+    if ! _atomic_modify_json "$CONFIG_FILE" ".inbounds |= map(if .tag == \"$in_tag\" then .tls.server_name = \"$new_sni\" else . end)"; then
+        _error "更新配置失败！"; _rollback_relay_sni; return 1
+    fi
+    if [ "$is_reality" == "true" ]; then
+        if ! _atomic_modify_json "$CONFIG_FILE" ".inbounds |= map(if .tag == \"$in_tag\" then .tls.reality.handshake.server = \"$new_sni\" else . end)"; then
+            _error "更新 Reality 握手域名失败！"; _rollback_relay_sni; return 1
+        fi
+    fi
+
+    # 2. 自签证书入口 (hysteria2/tuic/anytls)：为新 SNI 重新生成证书
+    local new_fp=""
+    if [ "$has_cert" == "true" ]; then
+        _info "正在为新 SNI 重新生成入口自签名证书..."
+        if openssl ecparam -genkey -name prime256v1 -out "$key_path" >/dev/null 2>&1 \
+            && openssl req -new -x509 -days 3650 -key "$key_path" -out "$cert_path" -subj "/CN=${new_sni}" >/dev/null 2>&1; then
+            new_fp=$(_cert_sha256_hex "$cert_path")
+        else
+            _error "证书重新生成失败！"; _rollback_relay_sni; return 1
+        fi
+    fi
+
+    # 3. 合并配置校验（config.json + relay.json 组合加载），失败回滚
+    if [ -x "$SINGBOX_BIN" ] && ! $SINGBOX_BIN check -c "$MAIN_CONFIG_FILE" -c "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "新配置未通过 sing-box 校验，已回滚。"
+        _rollback_relay_sni
+        return 1
+    fi
+
+    # 4. relay_links.json：分享链接 sni/pcs/pinSHA256 参数同步
+    if [ -f "$LINKS_FILE" ] && jq -e ".\"$in_tag\"" "$LINKS_FILE" >/dev/null 2>&1; then
+        local current_link=$(jq -r ".\"$in_tag\".link // \"\"" "$LINKS_FILE")
+        if [ -n "$current_link" ]; then
+            local new_link=$(echo "$current_link" | sed -E "s/([?&]sni=)[^&#]*/\1${new_sni}/g")
+            if [ -n "$new_fp" ]; then
+                new_link=$(echo "$new_link" | sed -E "s/([?&](pcs|pinSHA256)=)[0-9a-fA-F]+/\1${new_fp}/g")
+            fi
+            _atomic_modify_json "$LINKS_FILE" ".\"$in_tag\".link = \"$new_link\""
+        fi
+    fi
+
+    # 5. 中转 YAML 同步（vless 用 servername，其余协议用 sni；只更新已存在的字段）
+    local YQ_BINARY="/usr/local/bin/yq"
+    local node_name=$(jq -r --arg t "$in_tag" '.[$t].node_name // ""' "$LINKS_FILE" 2>/dev/null)
+    if [ -f "$RELAY_CLASH_YAML" ] && [ -f "$YQ_BINARY" ] && [ -n "$node_name" ]; then
+        export RELAY_SNI_NAME="$node_name"
+        export NEW_RELAY_SNI="$new_sni"
+        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxies[] | select(.name == env(RELAY_SNI_NAME)) | select(has("servername")) | .servername) = env(NEW_RELAY_SNI)'
+        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxies[] | select(.name == env(RELAY_SNI_NAME)) | select(has("sni")) | .sni) = env(NEW_RELAY_SNI)'
+        _info "YAML 配置 SNI 已同步: ${node_name}"
+    fi
+
+    rm -f "$backup_file" "${cert_path}.bak_sni" "${key_path}.bak_sni" 2>/dev/null
+
+    _log_operation "MODIFY_RELAY_SNI" "Tag: $in_tag, Old SNI: $old_sni, New SNI: $new_sni"
+
+    _success "SNI 修改成功: ${old_sni} -> ${new_sni}"
+    _manage_service restart
+    _success "服务已重启"
+
+    local updated_link=$(jq -r ".\"$in_tag\".link // \"\"" "$LINKS_FILE" 2>/dev/null)
+    if [ -n "$updated_link" ]; then
+        echo ""
+        echo -e "更新后的分享链接:"
+        echo -e "${CYAN}${updated_link}${NC}"
+    fi
+    if [ -n "$new_fp" ]; then
+        _info "入口自签证书已按新 SNI 重新生成，客户端如固定了证书指纹（pcs/pinSHA256）请使用新链接。"
+    fi
+    read -p "  按回车键继续..."
+}
+
 
 # ============================================================
 # --- 端口转发管理模块 (Port Forwarding) ---
@@ -2670,15 +2823,16 @@ _menu() {
         echo -e "    ${GREEN}[4]${NC} 查看当前中转链路"
         echo -e "    ${GREEN}[5]${NC} 删除指定中转路由"
         echo -e "    ${GREEN}[6]${NC} 修改中转监听端口"
-        echo -e "    ${RED}[7]${NC} 清空所有中转配置"
+        echo -e "    ${GREEN}[7]${NC} 修改中转入口 SNI"
+        echo -e "    ${RED}[8]${NC} 清空所有中转配置"
         echo ""
         echo -e "  ${CYAN}【端口转发】${NC}"
-        echo -e "    ${GREEN}[8]${NC} 端口转发管理"
+        echo -e "    ${GREEN}[9]${NC} 端口转发管理"
         echo ""
         echo -e "  ─────────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
-        read -p "  请输入选项 [0-8]: " choice
+        read -p "  请输入选项 [0-9]: " choice
         case $choice in
             1) _landing_config ;;
             2) _relay_config ;;
@@ -2686,7 +2840,8 @@ _menu() {
             4) _view_relays ;;
             5) _delete_relay ;;
             6) _modify_relay_port ;;
-            7) echo ""; _warn "确认清空所有中转配置?"; read -p "  (y/N): " cn;
+            7) _modify_relay_sni ;;
+            8) echo ""; _warn "确认清空所有中转配置?"; read -p "  (y/N): " cn;
                if [ "$cn" == "y" ]; then
                    echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
                    echo '{}' > "${RELAY_AUX_DIR}/relay_links.json"
@@ -2699,7 +2854,7 @@ _menu() {
                    _success "全部中转已清空"
                fi ;;
             0) break ;;
-            8) _port_forward_menu ;;
+            9) _port_forward_menu ;;
             *) _error "无效输入"; sleep 1 ;;
         esac
     done

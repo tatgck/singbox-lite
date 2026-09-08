@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="21"
+export SCRIPT_VERSION="22"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -4992,6 +4992,352 @@ _modify_port() {
 }
 
 # --- 更新管理脚本 ---
+# --- 修改节点（端口/SNI）二级菜单 ---
+_modify_node_menu() {
+    echo ""
+    echo -e "    ${GREEN}[1]${NC} 修改节点端口"
+    echo -e "    ${GREEN}[2]${NC} 修改节点 SNI"
+    echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
+    echo ""
+    read -p "  请选择 [0-2]: " modify_choice
+    case "$modify_choice" in
+        1) _modify_port ;;
+        2) _modify_sni ;;
+        *) ;;
+    esac
+}
+
+# 校验 SNI 域名格式（含至少一个点的合法主机名）
+_validate_sni_domain() {
+    [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]
+}
+
+_modify_sni() {
+    if ! jq -e '.inbounds | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
+        _warning "当前没有任何节点。"
+        return
+    fi
+
+    _info "--- 修改节点 SNI ---"
+
+    # 只列出带 TLS SNI 的节点（Reality / TLS 类）；SS、SOCKS5、纯 VLESS 无 SNI
+    local inbound_tags=()
+    local inbound_ports=()
+    local inbound_types=()
+    local inbound_snis=()
+    local display_names=()
+
+    local i=1
+    while IFS=$'\t' read -r tag type port sni; do
+        if [[ "$tag" == *"-hop-"* ]]; then continue; fi
+        [ -z "$sni" ] && continue
+
+        inbound_tags+=("$tag")
+        inbound_ports+=("$port")
+        inbound_types+=("$type")
+        inbound_snis+=("$sni")
+
+        local proxy_name_to_find=$(_find_proxy_name "$port" "$type" "$tag")
+        local meta_name=$(jq -r --arg t "$tag" '.[$t].name // empty' "$METADATA_FILE" 2>/dev/null)
+        local display_name=${proxy_name_to_find:-${meta_name:-$tag}}
+        display_names+=("$display_name")
+
+        echo -e "  ${CYAN}$i)${NC} ${display_name} (${YELLOW}${type}${NC}) @ ${GREEN}${port}${NC}  SNI: ${CYAN}${sni}${NC}"
+        ((i++))
+    done < <(jq -r '.inbounds[] | [.tag, .type, (.listen_port|tostring), (.tls.server_name // "")] | @tsv' "$CONFIG_FILE")
+
+    if [ ${#inbound_tags[@]} -eq 0 ]; then
+        _warning "没有可修改 SNI 的节点（仅 Reality / TLS 类节点有 SNI）。"
+        return
+    fi
+
+    read -p "请输入要修改 SNI 的节点编号 (输入 0 返回): " num
+    [[ ! "$num" =~ ^[0-9]+$ ]] || [ "$num" -eq 0 ] && return
+
+    local count=${#inbound_tags[@]}
+    if [ "$num" -gt "$count" ]; then
+        _error "编号超出范围。"
+        return
+    fi
+
+    local index=$((num - 1))
+    local tag_to_modify=${inbound_tags[$index]}
+    local type_to_modify=${inbound_types[$index]}
+    local port_to_modify=${inbound_ports[$index]}
+    local old_sni=${inbound_snis[$index]}
+    local display_name_to_modify=${display_names[$index]}
+
+    local node_json=$(jq -c --arg t "$tag_to_modify" '.inbounds[] | select(.tag == $t)' "$CONFIG_FILE")
+    local is_reality=$(echo "$node_json" | jq -r '.tls.reality.enabled // false')
+    local cert_path=$(echo "$node_json" | jq -r '.tls.certificate_path // ""')
+    local key_path=$(echo "$node_json" | jq -r '.tls.key_path // ""')
+
+    _info "当前节点: ${display_name_to_modify} (${type_to_modify})"
+    _info "当前 SNI: ${old_sni}"
+    if [ "$is_reality" == "true" ]; then
+        _info "Reality 节点：新 SNI 必须是支持 TLS 1.3 + HTTP/2 且直连可访问的真实域名（可用主菜单 [20] SNI 优选测试）。"
+    fi
+
+    read -p "请输入新的 SNI 域名: " new_sni
+    new_sni=$(echo "$new_sni" | xargs)
+    if [ -z "$new_sni" ]; then _warning "输入为空，已取消。"; return; fi
+    if ! _validate_sni_domain "$new_sni"; then _error "SNI 域名格式无效！"; return; fi
+    if [ "$new_sni" == "$old_sni" ]; then _warning "新 SNI 与当前相同，无需修改。"; return; fi
+
+    # 自签证书节点询问是否重新生成证书（在写配置前确认，便于失败时整体回滚）
+    local regen_cert="false"
+    if [ "$is_reality" != "true" ] && [ -n "$cert_path" ] && [ -f "$cert_path" ] && [[ "$cert_path" == ${SINGBOX_DIR}/* ]]; then
+        read -p "检测到自签名证书，是否同时为新 SNI 重新生成证书? (Y/n): " regen_choice
+        if [[ "$regen_choice" != "n" && "$regen_choice" != "N" ]]; then
+            regen_cert="true"
+        fi
+    fi
+
+    _info "正在修改 SNI: ${old_sni} -> ${new_sni}"
+
+    # 备份配置与证书，任一步失败可整体回滚
+    local backup_file="${CONFIG_FILE}.bak_sni_$$"
+    cp "$CONFIG_FILE" "$backup_file"
+    if [ "$regen_cert" == "true" ]; then
+        cp "$cert_path" "${cert_path}.bak_sni" 2>/dev/null
+        cp "$key_path" "${key_path}.bak_sni" 2>/dev/null
+    fi
+
+    _rollback_sni_change() {
+        mv "$backup_file" "$CONFIG_FILE" 2>/dev/null
+        if [ "$regen_cert" == "true" ]; then
+            [ -f "${cert_path}.bak_sni" ] && mv "${cert_path}.bak_sni" "$cert_path"
+            [ -f "${key_path}.bak_sni" ] && mv "${key_path}.bak_sni" "$key_path"
+        fi
+    }
+
+    # 1. config.json: 主节点及 HY2 跳跃子节点统一更新 server_name；Reality 同步 handshake.server
+    if ! _atomic_modify_json "$CONFIG_FILE" ".inbounds |= map(if ((.tag == \"$tag_to_modify\") or (.tag | startswith(\"${tag_to_modify}-hop-\"))) and ((.tls.server_name // null) != null) then .tls.server_name = \"$new_sni\" else . end)"; then
+        _error "更新配置失败！"; _rollback_sni_change; return 1
+    fi
+    if [ "$is_reality" == "true" ]; then
+        if ! _atomic_modify_json "$CONFIG_FILE" ".inbounds |= map(if (.tag == \"$tag_to_modify\") and ((.tls.reality // null) != null) then .tls.reality.handshake.server = \"$new_sni\" else . end)"; then
+            _error "更新 Reality 握手域名失败！"; _rollback_sni_change; return 1
+        fi
+    fi
+
+    # 2. 自签证书节点：为新 SNI 重新生成证书并记录新指纹
+    local old_fp=""
+    local new_fp=""
+    if [ "$regen_cert" == "true" ]; then
+        old_fp=$(_cert_sha256_hex "${cert_path}.bak_sni")
+        if _generate_self_signed_cert "$new_sni" "$cert_path" "$key_path"; then
+            new_fp=$(_cert_sha256_hex "$cert_path")
+        else
+            _error "证书重新生成失败！"; _rollback_sni_change; return 1
+        fi
+    fi
+
+    # 3. sing-box 校验，失败回滚
+    if ! ${SINGBOX_BIN} check -c "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "新配置未通过 sing-box 校验，已回滚。"
+        _rollback_sni_change
+        return 1
+    fi
+
+    # 4. clash.yaml 同步（vless 用 servername，其余协议用 sni；只更新已存在的字段）
+    local proxy_name=$(_find_proxy_name "$port_to_modify" "$type_to_modify" "$tag_to_modify")
+    if [ -n "$proxy_name" ] && [ -f "$CLASH_YAML_FILE" ]; then
+        export SNI_PROXY_NAME="$proxy_name"
+        export NEW_SNI_VAL="$new_sni"
+        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(SNI_PROXY_NAME)) | select(has("servername")) | .servername) = env(NEW_SNI_VAL)'
+        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(SNI_PROXY_NAME)) | select(has("sni")) | .sni) = env(NEW_SNI_VAL)'
+        _info "Clash 配置 SNI 已同步: ${proxy_name}"
+    fi
+
+    # 5. metadata.json: server_name 字段与分享链接 sni/pcs/pinSHA256 参数
+    if [ -f "$METADATA_FILE" ] && jq -e ".\"$tag_to_modify\"" "$METADATA_FILE" >/dev/null 2>&1; then
+        _atomic_modify_json "$METADATA_FILE" "if (.\"$tag_to_modify\" | has(\"server_name\")) then .\"$tag_to_modify\".server_name = \"$new_sni\" else . end"
+        local current_link=$(jq -r ".\"$tag_to_modify\".share_link // \"\"" "$METADATA_FILE")
+        if [ -n "$current_link" ]; then
+            local new_link=$(echo "$current_link" | sed -E "s/([?&]sni=)[^&#]*/\1${new_sni}/g; s/([?&]peer=)[^&#]*/\1${new_sni}/g")
+            if [ -n "$new_fp" ]; then
+                new_link=$(echo "$new_link" | sed -E "s/([?&](pcs|pinSHA256)=)[0-9a-fA-F]+/\1${new_fp}/g")
+            fi
+            _atomic_modify_json "$METADATA_FILE" ".\"$tag_to_modify\".share_link = \"$new_link\""
+        fi
+    fi
+
+    rm -f "$backup_file" "${cert_path}.bak_sni" "${key_path}.bak_sni" 2>/dev/null
+    _success "SNI 修改成功: ${old_sni} -> ${new_sni}"
+    _manage_service "restart"
+
+    local updated_link=$(jq -r ".\"$tag_to_modify\".share_link // \"\"" "$METADATA_FILE" 2>/dev/null)
+    if [ -n "$updated_link" ]; then
+        echo ""
+        echo -e "更新后的分享链接:"
+        echo -e "${CYAN}${updated_link}${NC}"
+    fi
+    if [ -n "$new_fp" ]; then
+        _info "自签证书已按新 SNI 重新生成，客户端如固定了证书指纹（pcs/pinSHA256）请使用新链接。"
+    fi
+}
+
+# ============================================================
+# --- SNI 优选（Reality/TLS 伪装域名测速）---
+# 优选标准参考 Reality 社区规范（XTLS/RealiTLScanner 项目思路）：
+#   目标域名需支持 TLS 1.3 + HTTP/2、直连可通、无跳转、非过于大众的域名
+# 本功能对内置候选池做 3 轮 TLS 握手延迟测试，综合延迟与稳定性给出前 5 名
+# ============================================================
+
+# 对单个域名做 3 轮 TLS 握手测试（读取全局 SNI_TLS13_FLAG 决定是否强制 TLS1.3）
+# 输出: avg_ms<TAB>jitter_ms<TAB>h2(✓/✗)<TAB>ok_rounds，有效轮次不足时无输出
+_sni_test_domain() {
+    local domain="$1"
+    local times=""
+    local h2="✗"
+    local ok=0
+    local r out t_ms hv
+
+    for r in 1 2 3; do
+        # -r 0-0 只取 1 字节，避免下载完整页面；退出码不作硬性要求：
+        # 部分 CDN 会拒绝 Range/HEAD 请求，但 TLS 握手耗时已经测得
+        out=$(curl -o /dev/null -s $SNI_TLS13_FLAG -r 0-0 --connect-timeout 3 -m 6 \
+            -w '%{time_appconnect} %{time_namelookup} %{http_version}' \
+            "https://${domain}/" 2>/dev/null)
+        if [ -n "$out" ]; then
+            # TLS 握手耗时 = appconnect - namelookup，排除 DNS 解析波动；握手失败时为 0
+            t_ms=$(echo "$out" | awk '{printf "%.0f", ($1-$2)*1000}')
+            hv=$(echo "$out" | awk '{print $3}')
+            if [ -n "$t_ms" ] && [ "$t_ms" -gt 0 ] 2>/dev/null; then
+                times="${times}${t_ms} "
+                ok=$((ok+1))
+                [ "$hv" == "2" ] && h2="✓"
+            fi
+        fi
+    done
+
+    [ "$ok" -lt 2 ] && return 1
+
+    echo "$times" | awk -v h2="$h2" -v ok="$ok" '{
+        min=99999; max=0; sum=0; n=0
+        for (i=1; i<=NF; i++) { sum+=$i; n++; if ($i<min) min=$i; if ($i>max) max=$i }
+        if (n>0) printf "%.0f\t%.0f\t%s\t%s\n", sum/n, max-min, h2, ok
+    }'
+}
+
+_sni_optimizer_menu() {
+    if ! command -v curl >/dev/null 2>&1; then
+        _error "缺少 curl 依赖，无法测试。"
+        return
+    fi
+
+    # 各地区候选池：均为 TLS1.3 + H2、直连可通、非跳转的知名企业域名
+    local pool_us="www.amd.com www.cisco.com aws.amazon.com www.dell.com addons.mozilla.org academy.nvidia.com swdist.apple.com updates.cdn-apple.com"
+    local pool_jp="www.lovelive-anime.jp www.nintendo.co.jp www.sony.jp www.canon.jp www.toyota.jp www.jal.co.jp www.sega.jp www.square-enix.co.jp"
+    local pool_sg="www.singaporeair.com www.dbs.com.sg www.sgx.com www.singtel.com www.starhub.com www.uob.com.sg www.capitaland.com www.grab.com"
+    local pool_hk="www.cathaypacific.com www.hkex.com.hk www.hangseng.com www.pccw.com www.towngas.com www.mtr.com.hk"
+    local pool_kr="www.hyundai.com www.kia.com www.lge.co.kr www.coupang.com www.krx.co.kr"
+    local pool_tw="www.asus.com www.gigabyte.com www.msi.com www.acer.com www.tsmc.com"
+    local pool_de="www.sap.com www.siemens.com www.bosch.com www.zalando.de www.mediamarkt.de"
+    local pool_gb="www.arm.com www.dyson.co.uk www.tesco.com www.bt.com www.burberry.com"
+    # 全球池：CDN Anycast 域名，就近接入，适合未收录地区
+    local pool_global="swdist.apple.com updates.cdn-apple.com gateway.icloud.com itunes.apple.com aws.amazon.com www.amd.com www.cisco.com addons.mozilla.org"
+
+    clear
+    echo -e "${CYAN}"
+    echo "  ╔═══════════════════════════════════════╗"
+    echo "  ║      SNI 优选（伪装域名测速）         ║"
+    echo "  ╚═══════════════════════════════════════╝"
+    echo -e "${NC}"
+    echo "  优选标准：TLS 1.3 + HTTP/2、直连可通、延迟低且稳定。"
+    echo "  测试方法：每个域名 3 轮 TLS 握手延迟测试（已排除 DNS 波动）。"
+    echo ""
+    echo -e "    ${GREEN}[1]${NC} 美国 (US)"
+    echo -e "    ${GREEN}[2]${NC} 日本 (JP)"
+    echo -e "    ${GREEN}[3]${NC} 新加坡 (SG)"
+    echo -e "    ${GREEN}[4]${NC} 自动检测当前服务器所在地区"
+    echo ""
+    echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
+    echo ""
+    read -p "  请选择目标区域 [0-4]: " region_choice
+
+    local pool=""
+    local region_name=""
+    case "$region_choice" in
+        1) pool="$pool_us"; region_name="美国" ;;
+        2) pool="$pool_jp"; region_name="日本" ;;
+        3) pool="$pool_sg"; region_name="新加坡" ;;
+        4)
+            _info "正在检测服务器所在地区..."
+            local country=$(curl -s -m 5 https://ipinfo.io/country 2>/dev/null | tr -d ' \n\r')
+            [ -z "$country" ] && country=$(curl -s -m 5 "http://ip-api.com/line/?fields=countryCode" 2>/dev/null | tr -d ' \n\r')
+            case "$country" in
+                US) pool="$pool_us"; region_name="美国 (US)" ;;
+                JP) pool="$pool_jp"; region_name="日本 (JP)" ;;
+                SG) pool="$pool_sg"; region_name="新加坡 (SG)" ;;
+                HK) pool="$pool_hk"; region_name="香港 (HK)" ;;
+                KR) pool="$pool_kr"; region_name="韩国 (KR)" ;;
+                TW) pool="$pool_tw"; region_name="台湾 (TW)" ;;
+                DE) pool="$pool_de"; region_name="德国 (DE)" ;;
+                GB) pool="$pool_gb"; region_name="英国 (GB)" ;;
+                "") pool="$pool_global"; region_name="未知地区（使用全球 CDN 池）" ;;
+                *)  pool="$pool_global"; region_name="${country}（未收录，使用全球 CDN 池）" ;;
+            esac
+            _info "检测结果: ${region_name}"
+            ;;
+        *) return ;;
+    esac
+
+    echo ""
+    _info "开始测试 ${region_name} 候选域名（每个 3 轮）..."
+
+    # 探测 curl 是否支持强制 TLS1.3（退出码 4 = 该构建不支持此选项）
+    SNI_TLS13_FLAG="--tlsv1.3"
+    curl -so /dev/null $SNI_TLS13_FLAG --connect-timeout 3 -m 5 "https://www.apple.com/" 2>/dev/null
+    if [ $? -eq 4 ]; then
+        SNI_TLS13_FLAG=""
+        _warn "当前 curl 构建不支持强制 TLS1.3，将只测握手延迟（Linux 服务器一般不受影响）。"
+    fi
+    echo ""
+
+    local results=""
+    local domain result avg jitter h2 ok score
+    for domain in $pool; do
+        printf '  测试 %-28s ... ' "$domain"
+        result=$(_sni_test_domain "$domain")
+        if [ -z "$result" ]; then
+            echo -e "${RED}握手失败/不支持 TLS1.3${NC}"
+            continue
+        fi
+        IFS=$'\t' read -r avg jitter h2 ok <<< "$result"
+        echo -e "平均 ${GREEN}${avg}ms${NC} 波动 ${YELLOW}${jitter}ms${NC} HTTP/2: ${h2} (${ok}/3)"
+        # 综合评分 = 平均延迟 + 波动惩罚；无 HTTP/2 追加 300ms 惩罚（Reality 要求 H2）
+        score=$((avg + jitter))
+        [ "$h2" != "✓" ] && score=$((score + 300))
+        results="${results}${score}\t${domain}\t${avg}\t${jitter}\t${h2}\n"
+    done
+
+    if [ -z "$results" ]; then
+        _error "所有候选域名测试失败，请检查网络。"
+        return
+    fi
+
+    echo ""
+    echo -e "${YELLOW}═════════════ 优选结果 TOP 5（最佳在最后）═════════════${NC}"
+    # 取综合评分前 5，倒序展示（最佳排最后，方便终端阅读）
+    local top5=$(echo -e "$results" | grep -v '^$' | sort -n | head -5 | sort -rn)
+    local rank=$(echo "$top5" | grep -c .)
+    while IFS=$'\t' read -r score domain avg jitter h2; do
+        [ -z "$domain" ] && continue
+        if [ "$rank" -eq 1 ]; then
+            echo -e "  ${GREEN}第 1 名  ${domain}${NC}  平均 ${avg}ms 波动 ${jitter}ms HTTP/2:${h2}  ${GREEN}<< 推荐${NC}"
+        else
+            echo -e "  第 ${rank} 名  ${CYAN}${domain}${NC}  平均 ${avg}ms 波动 ${jitter}ms HTTP/2:${h2}"
+        fi
+        rank=$((rank - 1))
+    done <<< "$top5"
+    echo -e "${YELLOW}═══════════════════════════════════════════════════════${NC}"
+    echo ""
+    _info "可将推荐域名用于：主菜单 [5] 修改节点 SNI，或 [18] 中转菜单 [7] 修改中转入口 SNI。"
+    _info "如需对本机 IP 同网段做深度扫描，可参考开源项目 XTLS/RealiTLScanner。"
+}
+
 _update_script() {
     _info "--- 更新脚本 ---"
     
@@ -5469,7 +5815,7 @@ _main_menu() {
         echo -e "  ${CYAN}【节点管理】${NC}"
         echo -e "    ${GREEN}[1]${NC} 添加节点          ${GREEN}[2]${NC} Argo 隧道节点"
         echo -e "    ${GREEN}[3]${NC} 查看节点链接      ${GREEN}[4]${NC} 删除节点"
-        echo -e "    ${GREEN}[5]${NC} 修改节点端口"
+        echo -e "    ${GREEN}[5]${NC} 修改节点端口/SNI"
         echo ""
         
         # 服务控制
@@ -5497,20 +5843,21 @@ _main_menu() {
         echo -e "  ${CYAN}【进阶功能】${NC}"
         echo -e "    ${GREEN}[18]${NC} 落地/中转/第三方节点导入"
         echo -e "    ${GREEN}[19]${NC} Xray 节点管理"
+        echo -e "    ${GREEN}[20]${NC} SNI 优选（伪装域名测速）"
         echo ""
-        
+
         echo -e "  ─────────────────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
-        
-        read -p "  请输入选项 [0-19]: " choice
- 
+
+        read -p "  请输入选项 [0-20]: " choice
+
         case $choice in
             1) _require_singbox && _show_add_node_menu ;;
             2) _require_singbox && _argo_menu ;;
             3) _require_singbox && _view_nodes ;;
             4) _require_singbox && _delete_node ;;
-            5) _require_singbox && _modify_port ;;
+            5) _require_singbox && _modify_node_menu ;;
             6) _require_singbox && _manage_service "restart" ;;
             7) _require_singbox && _manage_service "stop" ;;
             8) _require_singbox && _manage_service "status" ;;
@@ -5525,6 +5872,7 @@ _main_menu() {
             17) _uninstall ;; 
             18) _require_singbox && _advanced_features ;;
             19) _xray_features ;;
+            20) _sni_optimizer_menu ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac

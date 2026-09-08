@@ -111,6 +111,12 @@ sing-box 1.14 removed legacy DNS server formats (`address` field) and the `{"out
 - `_apply_dns_config()` (DNS menu) writes typed format; menu display reconstructs a readable address from typed servers
 - The `ENABLE_DEPRECATED_*` env vars still exported by scripts/service files are inert on 1.14 (harmless)
 
+### 4. SNI Modification + SNI Optimizer (v22)
+Three new features:
+- **Main menu [5]** is now a submenu: 1) modify port (existing `_modify_port`), 2) modify SNI (new `_modify_sni` in `singbox.sh`). SNI edit lists TLS/Reality nodes by number, updates `tls.server_name` (+ `tls.reality.handshake.server` for Reality, + hop children), optionally regenerates self-signed certs for the new domain, syncs clash.yaml (`servername`/`sni` fields, only if present), metadata `server_name` and share-link `sni=`/`peer=`/`pcs=`/`pinSHA256=` params. Validates with `sing-box check`, full rollback on failure.
+- **Relay menu [7] 修改中转入口 SNI** (`_modify_relay_sni` in `advanced_relay.sh`): same pattern for relay entrances (vless-reality/hysteria2/tuic/anytls); regenerates entrance certs (`RELAY_AUX_DIR/<tag>.pem`) with the simple `openssl req -subj /CN=` style used at creation; validates merged config (`check -c config.json -c relay.json`). Relay menu renumbered: clear-all 7→8, port-forwarding 8→9.
+- **Main menu [20] SNI 优选** (`_sni_optimizer_menu`): region pools (US/JP/SG + auto-detect via ipinfo.io→ip-api.com, plus HK/KR/TW/DE/GB pools and a global anycast-CDN fallback), 3 rounds of TLS handshake latency per domain via curl (`time_appconnect - time_namelookup`, exit code deliberately ignored since some CDNs reject Range/HEAD after a successful handshake), score = avg + jitter + 300ms penalty if no HTTP/2, top-5 shown reversed (best last). Probes curl for `--tlsv1.3` support once (exit 4 = unsupported build) and degrades gracefully.
+
 ## Common Development Tasks
 
 ### Testing SS Link Parsing
