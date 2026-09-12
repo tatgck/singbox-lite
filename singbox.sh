@@ -373,6 +373,33 @@ _init_server_ip() {
     fi
 }
 
+# 在启动或重启前校验实际会被加载的合并配置。
+# 只检查 config.json 会漏掉 relay.json 引入的冲突，导致服务启动后立即退出且原因不明显。
+_validate_merged_config() {
+    [ -x "$SINGBOX_BIN" ] || {
+        _error "未找到 sing-box 核心: ${SINGBOX_BIN}"
+        return 1
+    }
+    [ -s "$CONFIG_FILE" ] || {
+        _error "主配置不存在或为空: ${CONFIG_FILE}"
+        return 1
+    }
+    [ -s "${SINGBOX_DIR}/relay.json" ] || {
+        _error "中转配置不存在或为空: ${SINGBOX_DIR}/relay.json"
+        return 1
+    }
+
+    local validation_output
+    if validation_output=$(${SINGBOX_BIN} check -c "$CONFIG_FILE" -c "${SINGBOX_DIR}/relay.json" 2>&1); then
+        return 0
+    fi
+
+    _error "合并配置检查失败，已阻止启动/重启 sing-box。"
+    [ -n "$validation_output" ] && printf '%s\n' "$validation_output" >&2
+    _warn "请先运行主菜单 [12] 检查配置文件，或查看 journalctl -u sing-box -b。"
+    return 1
+}
+
 # 统一服务管理
 _manage_service() {
     local action="$1"
@@ -383,6 +410,10 @@ _manage_service() {
         if [ -s "$CONFIG_FILE" ] && ! jq -e '.ntp' "$CONFIG_FILE" >/dev/null 2>&1; then
             _info "检测到内核配置缺失内置时间同步(NTP)模块，正在自动注入防重放保护补丁..."
             _atomic_modify_json "$CONFIG_FILE" '.ntp = {"enabled": true, "server": "time.apple.com", "server_port": 123, "interval": "30m"}' 2>/dev/null
+        fi
+        [ -s "${SINGBOX_DIR}/relay.json" ] || echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "${SINGBOX_DIR}/relay.json"
+        if ! _validate_merged_config; then
+            return 1
         fi
     fi
 
@@ -411,6 +442,14 @@ _manage_service() {
                         "$SINGBOX_BIN" run -c "$CONFIG_FILE" -c "${SINGBOX_DIR}/relay.json" \
                         >> "$LOG_FILE" 2>&1 &
                     echo $! > "$PID_FILE"
+                    # 进程若因配置/证书错误立即退出，直接模式原先仍会显示“启动成功”。
+                    sleep 0.2
+                    if ! _is_pid_file_running_cmd "$PID_FILE" "$SINGBOX_BIN"; then
+                        _error "sing-box 启动后立即退出，日志位置: ${LOG_FILE}"
+                        [ -s "$LOG_FILE" ] && tail -n 30 "$LOG_FILE" >&2
+                        rm -f "$PID_FILE"
+                        return 1
+                    fi
                     _success "sing-box 已以 direct 后台模式启动。"
                     ;;
                 stop)
@@ -1889,6 +1928,7 @@ Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
 Environment="ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true"
 Environment="ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true"
 Environment="ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
+ExecStartPre=${SINGBOX_BIN} check -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json
 ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json
 Restart=on-failure
 RestartSec=3s
@@ -1921,6 +1961,10 @@ pidfile="${PID_FILE}"
 # 如果不支持，日志可能不会输出到文件，但服务能正常运行
 output_log="${LOG_FILE}"
 error_log="${LOG_FILE}"
+
+start_pre() {
+    "${SINGBOX_BIN}" check -c "${CONFIG_FILE}" -c "${SINGBOX_DIR}/relay.json"
+}
 
 depend() {
     need net
@@ -1998,7 +2042,8 @@ _remove_log_cleanup() {
 
 _view_log() {
     if [ "$INIT_SYSTEM" == "systemd" ]; then
-        _info "按 Ctrl+C 退出日志查看。"
+        _info "systemd 模式日志由 journal 管理；按 Ctrl+C 退出日志查看。"
+        _info "诊断命令: journalctl -u sing-box -b --no-pager"
         journalctl -u sing-box -f --no-pager
     else # 适用于 openrc 和 direct 模式
         if [ ! -f "$LOG_FILE" ]; then
@@ -4508,14 +4553,8 @@ _delete_node() {
 
 _check_config() {
     _info "正在检查 sing-box 配置文件..."
-    # 捕获所有输出（包括 stderr 产生的大量 WARN 和 TRACE 弃用警告）
-    local result
-    result=$(${SINGBOX_BIN} check -c ${CONFIG_FILE} 2>&1)
-    if [[ $? -eq 0 ]]; then
-        _success "配置文件 (${CONFIG_FILE}) 格式正确。"
-    else
-        _error "配置文件检查失败:"
-        echo "$result"
+    if _validate_merged_config; then
+        _success "主配置与中转配置合并检查通过。"
     fi
 }
 
@@ -5134,8 +5173,8 @@ _modify_sni() {
     fi
 
     # 3. sing-box 校验，失败回滚
-    if ! ${SINGBOX_BIN} check -c "$CONFIG_FILE" >/dev/null 2>&1; then
-        _error "新配置未通过 sing-box 校验，已回滚。"
+    if ! _validate_merged_config >/dev/null 2>&1; then
+        _error "新配置未通过合并配置校验，已回滚。"
         _rollback_sni_change
         return 1
     fi
@@ -5179,10 +5218,11 @@ _modify_sni() {
 }
 
 # ============================================================
-# --- SNI 优选（Reality/TLS 伪装域名测速）---
+# --- SNI 候选筛选（Reality/TLS 伪装域名）---
 # 优选标准参考 Reality 社区规范（XTLS/RealiTLScanner 项目思路）：
 #   目标域名需支持 TLS 1.3 + HTTP/2、直连可通、无跳转、非过于大众的域名
-# 本功能对内置候选池做 3 轮 TLS 握手延迟测试，综合延迟与稳定性给出前 5 名
+# 本功能只验证“运行脚本的 VPS -> 域名”是否可完成 TLS 握手。
+# 它不能代表中国客户端到该域名的可达性，因此结果不能作为国内链路排名。
 # ============================================================
 
 # 对单个域名做 3 轮 TLS 握手测试（读取全局 SNI_TLS13_FLAG 决定是否强制 TLS1.3）
@@ -5245,8 +5285,9 @@ _sni_optimizer_menu() {
     echo "  ║      SNI 优选（伪装域名测速）         ║"
     echo "  ╚═══════════════════════════════════════╝"
     echo -e "${NC}"
-    echo "  优选标准：TLS 1.3 + HTTP/2、直连可通、延迟低且稳定。"
-    echo "  测试方法：每个域名 3 轮 TLS 握手延迟测试（已排除 DNS 波动）。"
+    echo "  筛选标准：TLS 1.3 + HTTP/2、VPS 侧直连可通、握手稳定。"
+    echo "  测试方法：每个域名 3 轮 TLS 握手测试（已排除 DNS 波动）。"
+    _warn "重要：测试从当前 VPS 发起，不能证明中国客户端直连可用；正式使用前必须从实际客户端复测。"
     echo ""
     echo -e "    ${GREEN}[1]${NC} 美国 (US)"
     echo -e "    ${GREEN}[2]${NC} 日本 (JP)"
@@ -5319,8 +5360,8 @@ _sni_optimizer_menu() {
     fi
 
     echo ""
-    echo -e "${YELLOW}═════════════ 优选结果 TOP 5（最佳在最后）═════════════${NC}"
-    # 取综合评分前 5，倒序展示（最佳排最后，方便终端阅读）
+    echo -e "${YELLOW}═════════════ VPS 侧候选结果 TOP 5（最佳在最后）═════════════${NC}"
+    # 取 VPS 侧综合评分前 5，倒序展示（不代表国内客户端排名）
     local top5=$(echo -e "$results" | grep -v '^$' | sort -n | head -5 | sort -rn)
     local rank=$(echo "$top5" | grep -c .)
     while IFS=$'\t' read -r score domain avg jitter h2; do
@@ -5334,8 +5375,8 @@ _sni_optimizer_menu() {
     done <<< "$top5"
     echo -e "${YELLOW}═══════════════════════════════════════════════════════${NC}"
     echo ""
-    _info "可将推荐域名用于：主菜单 [5] 修改节点 SNI，或 [18] 中转菜单 [7] 修改中转入口 SNI。"
-    _info "如需对本机 IP 同网段做深度扫描，可参考开源项目 XTLS/RealiTLScanner。"
+    _info "候选域名仅在 VPS 侧通过握手校验；用于节点前，请从中国客户端实际测试该域名。"
+    _info "通过验证后可用于：主菜单 [5] 修改节点 SNI，或 [18] 中转菜单 [7] 修改中转入口 SNI。"
 }
 
 _update_script() {
@@ -6422,8 +6463,20 @@ main() {
                 _warn "检测到旧版服务配置(目录加载模式导致冲突)，正在修复..."
                 need_update=true
             fi
+            if [ "$INIT_SYSTEM" == "systemd" ] && ! grep -q '^ExecStartPre=.*sing-box.*check' "$SERVICE_FILE"; then
+                _warn "检测到服务缺少启动前合并配置校验，正在修复..."
+                need_update=true
+            fi
+            if [ "$INIT_SYSTEM" == "systemd" ] && ! grep -q 'relay\.json' "$SERVICE_FILE"; then
+                _warn "检测到服务未加载 relay.json，正在修复..."
+                need_update=true
+            fi
             if [ "$INIT_SYSTEM" == "openrc" ] && ! grep -q "supervisor=" "$SERVICE_FILE"; then
                 _warn "检测到旧版 OpenRC 服务配置，正在修复以兼容 Alpine..."
+                need_update=true
+            fi
+            if [ "$INIT_SYSTEM" == "openrc" ] && ! grep -q '^start_pre()' "$SERVICE_FILE"; then
+                _warn "检测到 OpenRC 服务缺少启动前配置校验，正在修复..."
                 need_update=true
             fi
             if [ "$need_update" = true ]; then

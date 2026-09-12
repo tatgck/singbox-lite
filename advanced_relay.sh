@@ -288,6 +288,26 @@ _atomic_modify_yaml() {
     fi
 }
 
+# 中转脚本也必须校验主配置与 relay.json 的合并结果，避免从子菜单重启时绕过主脚本保护。
+_validate_merged_config() {
+    [ -x "$SINGBOX_BIN" ] || {
+        _error "未找到 sing-box 核心: ${SINGBOX_BIN}"
+        return 1
+    }
+    [ -s "$MAIN_CONFIG_FILE" ] || {
+        _error "主配置不存在或为空: ${MAIN_CONFIG_FILE}"
+        return 1
+    }
+    [ -s "$RELAY_CONFIG_FILE" ] || echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
+    local output
+    if output=$(${SINGBOX_BIN} check -c "$MAIN_CONFIG_FILE" -c "$RELAY_CONFIG_FILE" 2>&1); then
+        return 0
+    fi
+    _error "合并配置检查失败，已阻止中转服务启动/重启。"
+    [ -n "$output" ] && printf '%s\n' "$output" >&2
+    return 1
+}
+
 # 服务管理
 _manage_service() {
     local action="$1"
@@ -295,6 +315,10 @@ _manage_service() {
     local service_pkg="sing-box"
     # 如果检测到中转专用服务文件，则使用单机中转模式
     [ -f "/etc/systemd/system/sing-box-relay.service" ] && service_pkg="sing-box-relay"
+
+    if [[ "$action" == "restart" || "$action" == "start" ]] && ! _validate_merged_config; then
+        return 1
+    fi
 
     _info "执行服务操作: $action ($service_pkg)..."
     case "$INIT_SYSTEM" in
@@ -316,6 +340,13 @@ _manage_service() {
                         "$SINGBOX_BIN" run -c "$MAIN_CONFIG_FILE" -c "$RELAY_CONFIG_FILE" \
                         >> "$log_file" 2>&1 &
                     echo $! > "$pid_file"
+                    sleep 0.2
+                    if ! _is_pid_file_running_cmd "$pid_file" "$SINGBOX_BIN"; then
+                        _error "sing-box 启动后立即退出，日志位置: ${log_file}"
+                        [ -s "$log_file" ] && tail -n 30 "$log_file" >&2
+                        rm -f "$pid_file"
+                        return 1
+                    fi
                     ;;
                 stop)
                     if [ -s "$pid_file" ]; then
