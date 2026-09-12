@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is **singbox-lite**, a comprehensive sing-box + Xray dual-core management script suite for Linux servers. It provides automated node creation, relay/transit configurations, third-party node import, port forwarding, Argo tunnels, and Clash/Mihomo configuration export.
 
-**Current script versions**: `singbox.sh v20`, `advanced_relay.sh`, `parser.sh`, `xray_manager.sh`
+**Current script versions**: `singbox.sh v24`, `advanced_relay.sh`, `parser.sh`, `xray_manager.sh`
 
-Note: The README.md describes v28 features (latest upstream), but the current codebase contains v20 scripts with recent fixes applied.
+Note: The README.md describes v28 features (latest upstream), while this fork currently tracks v24 scripts with additional fixes applied.
 
 ## Repository Structure
 
@@ -111,11 +111,20 @@ sing-box 1.14 removed legacy DNS server formats (`address` field) and the `{"out
 - `_apply_dns_config()` (DNS menu) writes typed format; menu display reconstructs a readable address from typed servers
 - The `ENABLE_DEPRECATED_*` env vars still exported by scripts/service files are inert on 1.14 (harmless)
 
-### 4. SNI Modification + SNI Optimizer (v22)
+### 4. SNI Modification + SNI Optimizer (v23)
 Three new features:
 - **Main menu [5]** is now a submenu: 1) modify port (existing `_modify_port`), 2) modify SNI (new `_modify_sni` in `singbox.sh`). SNI edit lists TLS/Reality nodes by number, updates `tls.server_name` (+ `tls.reality.handshake.server` for Reality, + hop children), optionally regenerates self-signed certs for the new domain, syncs clash.yaml (`servername`/`sni` fields, only if present), metadata `server_name` and share-link `sni=`/`peer=`/`pcs=`/`pinSHA256=` params. Validates with `sing-box check`, full rollback on failure.
 - **Relay menu [7] 修改中转入口 SNI** (`_modify_relay_sni` in `advanced_relay.sh`): same pattern for relay entrances (vless-reality/hysteria2/tuic/anytls); regenerates entrance certs (`RELAY_AUX_DIR/<tag>.pem`) with the simple `openssl req -subj /CN=` style used at creation; validates merged config (`check -c config.json -c relay.json`). Relay menu renumbered: clear-all 7→8, port-forwarding 8→9.
 - **Main menu [20] SNI 优选** (`_sni_optimizer_menu`): region pools (US/JP/SG + auto-detect via ipinfo.io→ip-api.com, plus HK/KR/TW/DE/GB pools and a global anycast-CDN fallback), 3 rounds of TLS handshake latency per domain via curl (`time_appconnect - time_namelookup`, exit code deliberately ignored since some CDNs reject Range/HEAD after a successful handshake), score = avg + jitter + 300ms penalty if no HTTP/2, top-5 shown reversed (best last). Probes curl for `--tlsv1.3` support once (exit 4 = unsupported build) and degrades gracefully.
+
+### 5. Node Creation and Update Verification (v24)
+- Node creation no longer reports success at config-write time. The main menu snapshots `config.json`, `clash.yaml`, and metadata, then requires merged-config validation, service restart, and every newly added primary port to be listening before reporting success; failures restore the snapshot.
+- Batch creation tracks each protocol function return value, validates the restarted service and planned ports, and rolls back the whole batch on any failure.
+- YAML and share-link metadata writes now propagate failures to the caller instead of being silently ignored.
+- Script updates compare downloaded content before replacing the local file. An unchanged remote file reports that the current version is already up to date; a same-version content change is reported explicitly instead of as `vX -> vX`.
+- Alpine Linux 3.21 uses the OpenRC path; node readiness requires `rc-service sing-box status`, a live sing-box process, and `ss` from the `iproute2` package, with a short retry window for delayed socket binding.
+- The 1.14 DNS path now also sets `dns.final` to `dns-local`; DNS changes are checked against the combined `config.json + relay.json` before replacing the active configuration and are rolled back if service restart fails.
+- The updater uses fail-fast `curl` with a `wget` fallback and refuses to overwrite a newer local script with an older remote version.
 
 ## Common Development Tasks
 
@@ -163,7 +172,7 @@ git push origin main
 
 ## Notes for Future Sessions
 
-- README.md describes v28 features; current scripts are v20 with fixes
+- README.md describes v28 features; current scripts are v24 with fixes
 - Parser supports strict protocol-specific parsing (no auto-detection fallback)
 - All scripts share a state lock mechanism at `/var/lock/singbox_relay.lock`
 - Atomic writes use temp files + `mv` for JSON/YAML updates

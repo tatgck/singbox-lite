@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="22"
+export SCRIPT_VERSION="24"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -396,8 +396,84 @@ _validate_merged_config() {
 
     _error "合并配置检查失败，已阻止启动/重启 sing-box。"
     [ -n "$validation_output" ] && printf '%s\n' "$validation_output" >&2
-    _warn "请先运行主菜单 [12] 检查配置文件，或查看 journalctl -u sing-box -b。"
+    if [ "$INIT_SYSTEM" = "openrc" ] || [ "$INIT_SYSTEM" = "direct" ]; then
+        _warn "请先运行主菜单 [12] 检查配置文件，或查看 ${LOG_FILE}（Alpine/OpenRC 日志）。"
+    else
+        _warn "请先运行主菜单 [12] 检查配置文件，或查看 journalctl -u sing-box -b。"
+    fi
     return 1
+}
+
+_verify_service_ready() {
+    local port="$1" proto="${2:-tcp}"
+    if [ -n "$port" ] && ! command -v ss >/dev/null 2>&1; then
+        _error "缺少 ss，无法确认端口 ${port} 是否真实监听。请在 Alpine 3.21 安装 iproute2。"
+        return 1
+    fi
+
+    local attempt=0
+    while [ "$attempt" -lt 10 ]; do
+        local service_active=false
+        case "$INIT_SYSTEM" in
+            systemd) systemctl is-active --quiet sing-box && service_active=true ;;
+            openrc)
+                local openrc_status
+                openrc_status=$(rc-service sing-box status 2>&1 || true)
+                # supervise-daemon 的 status 可能只反映 supervisor 本身；同时确认
+                # sing-box 进程仍在，避免把“启动命令已返回”当成就绪。
+                if printf '%s\n' "$openrc_status" | grep -Eiq 'started|running' \
+                    && { _is_pid_file_running_cmd "$PID_FILE" "$SINGBOX_BIN" \
+                         || (command -v pgrep >/dev/null 2>&1 && pgrep -f "${SINGBOX_BIN} run" >/dev/null 2>&1); }; then
+                    service_active=true
+                fi
+                ;;
+            direct) _is_pid_file_running_cmd "$PID_FILE" "$SINGBOX_BIN" && service_active=true ;;
+            *) return 1 ;;
+        esac
+
+        if [ "$service_active" = true ] && [ -n "$port" ]; then
+            local sockets
+            if [ "$proto" = "udp" ]; then
+                sockets=$(ss -lnu 2>/dev/null)
+            elif [ "$proto" = "any" ]; then
+                sockets="$(ss -ln 2>/dev/null)\n$(ss -lnu 2>/dev/null)"
+            else
+                sockets=$(ss -ln 2>/dev/null)
+            fi
+            if printf '%b\n' "$sockets" | grep -Eq "[:.]${port}[[:space:]]"; then
+                return 0
+            fi
+        elif [ "$service_active" = true ]; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 0.5
+    done
+    return 1
+}
+
+_snapshot_node_state() {
+    local dir="$1"
+    mkdir -p "$dir" || return 1
+    for file in "$CONFIG_FILE" "$CLASH_YAML_FILE" "$METADATA_FILE" "$ARGO_METADATA_FILE"; do
+        if [ -f "$file" ]; then
+            cp -p "$file" "$dir/$(basename "$file")" || return 1
+        else
+            : > "$dir/$(basename "$file").missing" || return 1
+        fi
+    done
+}
+
+_restore_node_state() {
+    local dir="$1" file base
+    for file in "$CONFIG_FILE" "$CLASH_YAML_FILE" "$METADATA_FILE" "$ARGO_METADATA_FILE"; do
+        base=$(basename "$file")
+        if [ -f "$dir/$base.missing" ]; then
+            rm -f "$file"
+        elif [ -f "$dir/$base" ]; then
+            cp -p "$dir/$base" "$file"
+        fi
+    done
 }
 
 # 统一服务管理
@@ -480,7 +556,7 @@ _manage_service() {
                 *) _error "direct 模式不支持的服务操作: $action"; return 1 ;;
             esac
             ;;
-        *) _error "不支持的服务管理系统" ;;
+        *) _error "不支持的服务管理系统"; return 1 ;;
     esac
 }
 
@@ -529,6 +605,34 @@ _atomic_modify_yaml() {
     fi
 }
 
+# 事务与服务校验共用的配置路径/辅助函数。旧版本只在部分代码路径中
+# 使用了这些名称，导致节点创建失败后的回滚无法正确恢复 relay.json。
+export RELAY_CONFIG_FILE="${SINGBOX_DIR}/relay.json"
+
+_ensure_relay_config() {
+    if [ ! -s "$RELAY_CONFIG_FILE" ]; then
+        mkdir -p "$(dirname "$RELAY_CONFIG_FILE")" || return 1
+        printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE" || return 1
+    fi
+    jq empty "$RELAY_CONFIG_FILE" >/dev/null 2>&1
+}
+
+_check_combined_config_files() {
+    local binary="${1:-$SINGBOX_BIN}" main_config="${2:-$CONFIG_FILE}" relay_config="${3:-$RELAY_CONFIG_FILE}"
+    [ -x "$binary" ] || { printf '%s\n' "未找到 sing-box 核心: $binary"; return 1; }
+    [ -s "$main_config" ] || { printf '%s\n' "主配置不存在或为空: $main_config"; return 1; }
+    [ -s "$relay_config" ] || { printf '%s\n' "中转配置不存在或为空: $relay_config"; return 1; }
+    "$binary" check -c "$main_config" -c "$relay_config"
+}
+
+_secure_state_permissions() {
+    [ -d "$SINGBOX_DIR" ] && chmod 700 "$SINGBOX_DIR" 2>/dev/null || true
+    local path
+    for path in "$CONFIG_FILE" "$CLASH_YAML_FILE" "$METADATA_FILE" "$ARGO_METADATA_FILE" "$RELAY_CONFIG_FILE"; do
+        [ -f "$path" ] && chmod 600 "$path" 2>/dev/null || true
+    done
+}
+
 # --- 资源与环境管理 ---
 
 # 系统时间同步 (解决 TLS 握手 EOF 问题)
@@ -567,7 +671,7 @@ _add_node_to_yaml() {
     local proxy_name=$(echo "$proxy_json" | jq -r .name)
     _atomic_modify_yaml "$CLASH_YAML_FILE" ".proxies |= . + [${proxy_json}] | .proxies |= unique_by(.name)" || return 1
     export PROXY_NAME="$proxy_name"
-    _atomic_modify_yaml "$CLASH_YAML_FILE" '.proxy-groups[] |= (select(.name == "节点选择") | .proxies |= . + [env(PROXY_NAME)] | .proxies |= unique)'
+    _atomic_modify_yaml "$CLASH_YAML_FILE" '.proxy-groups[] |= (select(.name == "节点选择") | .proxies |= . + [env(PROXY_NAME)] | .proxies |= unique)' || return 1
 }
 _remove_node_from_yaml() {
     local proxy_name="$1"
@@ -1180,7 +1284,11 @@ _add_argo_node() {
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]" || return 1
 
     # === [公共] 重启 + 启动隧道 ===
-    _manage_service "restart"
+    if ! _manage_service "restart"; then
+        _error "sing-box 服务重启失败，无法创建 Argo 节点。"
+        _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))" >/dev/null 2>&1 || true
+        return 1
+    fi
     sleep 2
 
     if [ "$argo_type" == "fixed" ]; then
@@ -1225,7 +1333,7 @@ _add_argo_node() {
     if [ ! -f "$ARGO_METADATA_FILE" ]; then
         echo '{}' > "$ARGO_METADATA_FILE"
     fi
-    _atomic_modify_json "$ARGO_METADATA_FILE" ". + $argo_meta"
+    _atomic_modify_json "$ARGO_METADATA_FILE" ". + $argo_meta" || return 1
 
     # === [协议特定] Clash 配置 + 分享链接 ===
     local proxy_json=""
@@ -1286,13 +1394,13 @@ _add_argo_node() {
             }')
     fi
 
-    _add_node_to_yaml "$proxy_json"
+    _add_node_to_yaml "$proxy_json" || return 1
 
     # === [公共] 启用守护 + 显示结果 ===
     _enable_argo_watchdog
 
     echo ""
-    _success "${protocol_label} + Argo 节点创建成功!"
+    _info "${protocol_label} + Argo 节点配置已写入，等待服务校验..."
     echo "-------------------------------------------"
     echo -e "节点名称: ${GREEN}${name}${NC}"
     echo -e "隧道类型: ${CYAN}${argo_type}${NC}"
@@ -2171,6 +2279,7 @@ _initialize_config_files() {
         "prefer_go": true
       }
     ],
+    "final": "dns-local",
     "strategy": "prefer_ipv4"
   },
   "inbounds": [],
@@ -2184,7 +2293,8 @@ _initialize_config_files() {
     "rules": [],
     "final": "direct",
     "default_domain_resolver": {
-      "server": "dns-local"
+      "server": "dns-local",
+      "strategy": "prefer_ipv4"
     }
   }
 }
@@ -2437,9 +2547,10 @@ _check_and_fix_dns() {
             | .dns.servers = (if $replace then [$server] else .dns.servers end)
             | .dns.rules = ([(.dns.rules // [])[] | select(has("outbound") | not)])
             | (if (.dns.rules | length) == 0 then del(.dns.rules) else . end)
+            | .dns.final = (if ((.dns.final // "") == "") then "dns-local" else .dns.final end)
             | .dns.strategy = (if ((.dns.strategy // "") == "") then "prefer_ipv4" else .dns.strategy end)
             | .route = (.route // {})
-            | .route.default_domain_resolver = {"server": $rtag}
+            | .route.default_domain_resolver = {"server": $rtag, "strategy": (.dns.strategy // "prefer_ipv4")}
             | del(.route.auto_detect_interface)
         ' "$CONFIG_FILE" > "$tmp_file"
 
@@ -2662,9 +2773,9 @@ _show_node_link() {
         # [持久化] 将生成的链接存入元数据，防止查看时由于动态提取导致的 SNI 丢失
         if [ -n "$tag" ] && [ "$tag" != "null" ]; then
             if [[ "$tag" == argo-* ]]; then
-                _atomic_modify_json "$ARGO_METADATA_FILE" ". + { \"$tag\": ((.[\"$tag\"] // {}) + { \"share_link\": \"$url\" }) }"
+                _atomic_modify_json "$ARGO_METADATA_FILE" ". + { \"$tag\": ((.[\"$tag\"] // {}) + { \"share_link\": \"$url\" }) }" || return 1
             else
-                _atomic_modify_json "$METADATA_FILE" ". + { \"$tag\": ((.[\"$tag\"] // {}) + { \"share_link\": \"$url\" }) }"
+                _atomic_modify_json "$METADATA_FILE" ". + { \"$tag\": ((.[\"$tag\"] // {}) + { \"share_link\": \"$url\" }) }" || return 1
             fi
         fi
     fi
@@ -2877,11 +2988,11 @@ _add_vless_ws_tls() {
                 }
             }')
             
-    _add_node_to_yaml "$proxy_json"
-    _success "VLESS (WebSocket+TLS) 节点 [${name}] 添加成功!"
-    _success "客户端连接地址 (server): ${client_server_addr}"
-    _success "客户端连接端口 (port): ${client_port}"
-    _success "客户端伪装域名 (sni/Host): ${camouflage_domain}"
+    _add_node_to_yaml "$proxy_json" || return 1
+    _info "VLESS (WebSocket+TLS) 节点 [${name}] 配置已写入，等待服务校验..."
+    _info "客户端连接地址 (server): ${client_server_addr}"
+    _info "客户端连接端口 (port): ${client_port}"
+    _info "客户端伪装域名 (sni/Host): ${camouflage_domain}"
     
     # CDN 指引 (仅在非批量模式下详细显示)
     [ "$BATCH_MODE" != "true" ] && _show_cdn_guidance "${camouflage_domain}" "${port}"
@@ -3044,12 +3155,12 @@ _add_vless_grpc_tls() {
                 }
             }')
 
-    _add_node_to_yaml "$proxy_json"
-    _success "VLESS (gRPC+TLS) 节点 [${name}] 添加成功!"
-    _success "客户端连接地址 (server): ${client_server_addr}"
-    _success "客户端连接端口 (port): ${client_port}"
-    _success "客户端伪装域名 (sni): ${camouflage_domain}"
-    _success "gRPC serviceName: ${service_name}"
+    _add_node_to_yaml "$proxy_json" || return 1
+    _info "VLESS (gRPC+TLS) 节点 [${name}] 配置已写入，等待服务校验..."
+    _info "客户端连接地址 (server): ${client_server_addr}"
+    _info "客户端连接端口 (port): ${client_port}"
+    _info "客户端伪装域名 (sni): ${camouflage_domain}"
+    _info "gRPC serviceName: ${service_name}"
 
     [ "$BATCH_MODE" != "true" ] && _show_grpc_cdn_guidance "${camouflage_domain}" "${port}"
 
@@ -3234,11 +3345,11 @@ _add_trojan_ws_tls() {
                 }
             }')
             
-    _add_node_to_yaml "$proxy_json"
-    _success "Trojan (WebSocket+TLS) 节点 [${name}] 添加成功!"
-    _success "客户端连接地址 (server): ${client_server_addr}"
-    _success "客户端连接端口 (port): ${client_port}"
-    _success "客户端伪装域名 (sni/Host): ${camouflage_domain}"
+    _add_node_to_yaml "$proxy_json" || return 1
+    _info "Trojan (WebSocket+TLS) 节点 [${name}] 配置已写入，等待服务校验..."
+    _info "客户端连接地址 (server): ${client_server_addr}"
+    _info "客户端连接端口 (port): ${client_port}"
+    _info "客户端伪装域名 (sni/Host): ${camouflage_domain}"
     
     # CDN 指引 (仅在非批量模式下详细显示)
     [ "$BATCH_MODE" != "true" ] && _show_cdn_guidance "${camouflage_domain}" "${port}"
@@ -3358,7 +3469,7 @@ _create_anytls_tls_node() {
             "skip-cert-verify": ($skip_verify_bool == "true")
         }')
     
-    _add_node_to_yaml "$proxy_json"
+    _add_node_to_yaml "$proxy_json" || return 1
     
     # --- 保存元数据 ---
     local meta_json
@@ -3372,7 +3483,7 @@ _create_anytls_tls_node() {
     fi
     local share_link="anytls://${password}@${link_ip}:${port}?security=tls&sni=${server_name}${insecure_param}&type=tcp#$(_url_encode "$name")"
     
-    _success "AnyTLS 节点 [${name}] 添加成功!"
+    _info "AnyTLS 节点 [${name}] 配置已写入，等待服务校验..."
     _show_node_link "anytls" "$name" "$link_ip" "$port" "$tag" "$password" "$server_name" "$skip_verify"
 }
 
@@ -3436,7 +3547,7 @@ _create_anyreality_node() {
         '{type:$type, name:$n, server_name:$sn, publicKey:$pub, shortId:$sid, share_link:$link, yaml:false}')
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
 
-    _success "Any-Reality 节点 [${name}] 添加成功!"
+    _info "Any-Reality 节点 [${name}] 配置已写入，等待服务校验..."
     _warning "Any-Reality 为 AnyTLS + Reality，Mihomo/Clash 不支持，已跳过写入 clash.yaml。"
     _show_node_link "any-reality" "$name" "$link_ip" "$port" "$tag" "$password" "$server_name" "$public_key" "$short_id"
 }
@@ -3594,8 +3705,8 @@ _add_vless_reality() {
     
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg pbk "$public_key" --arg sid "$short_id" \
         '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":true,"network":"tcp","flow":"xtls-rprx-vision","servername":$sn,"client-fingerprint":"chrome","reality-opts":{"public-key":$pbk,"short-id":$sid}}')
-    _add_node_to_yaml "$proxy_json"
-    _success "VLESS (REALITY) 节点 [${name}] 添加成功!"
+    _add_node_to_yaml "$proxy_json" || return 1
+    _info "VLESS (REALITY) 节点 [${name}] 配置已写入，等待服务校验..."
     _show_node_link "vless-reality" "$name" "$link_ip" "$port" "$tag" "$uuid" "$server_name" "$public_key" "$short_id"
 }
 
@@ -3641,8 +3752,8 @@ _add_vless_tcp() {
     
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" \
         '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":false,"network":"tcp"}')
-    _add_node_to_yaml "$proxy_json"
-    _success "VLESS (TCP) 节点 [${name}] 添加成功!"
+    _add_node_to_yaml "$proxy_json" || return 1
+    _info "VLESS (TCP) 节点 [${name}] 配置已写入，等待服务校验..."
     _show_node_link "vless-tcp" "$name" "$link_ip" "$port" "$tag" "$uuid"
 }
 
@@ -3834,9 +3945,9 @@ _add_hysteria2() {
             "up": ($up|tonumber),
             "down": ($down|tonumber)
         } | if $op != "" then .obfs = "salamander" | .["obfs-password"] = $op else . end | if $hop != "" then .ports = $hop else . end')
-    _add_node_to_yaml "$proxy_json"
+    _add_node_to_yaml "$proxy_json" || return 1
     
-    _success "Hysteria2 节点 [${name}] 添加成功!"
+    _info "Hysteria2 节点 [${name}] 配置已写入，等待服务校验..."
     
     # 显示端口跳跃信息
     if [ -n "$port_hopping" ]; then
@@ -3895,8 +4006,8 @@ _add_tuic() {
     
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sn "$server_name" \
         '{"name":$n,"type":"tuic","server":$s,"port":($p|tonumber),"uuid":$u,"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"udp-relay-mode":"native","congestion-controller":"bbr"}')
-    _add_node_to_yaml "$proxy_json"
-    _success "TUICv5 节点 [${name}] 添加成功!"
+    _add_node_to_yaml "$proxy_json" || return 1
+    _info "TUICv5 节点 [${name}] 配置已写入，等待服务校验..."
     _show_node_link "tuic" "$name" "$link_ip" "$port" "$tag" "$uuid" "$password" "$server_name"
 }
 
@@ -4099,9 +4210,9 @@ _add_shadowsocks_menu() {
                 "password": $pw
             }')
     fi
-    _add_node_to_yaml "$proxy_json"
+    _add_node_to_yaml "$proxy_json" || return 1
 
-    _success "Shadowsocks (${method}) 节点 [${name}] 添加成功!"
+    _info "Shadowsocks (${method}) 节点 [${name}] 配置已写入，等待服务校验..."
     if [ "$use_multiplex" == "true" ]; then
         _info "Multiplex + Padding 已启用，客户端需配置对应选项"
     fi
@@ -4151,8 +4262,8 @@ _add_socks() {
 
     local proxy_json=$(jq -n --arg n "$name" --arg s "$display_ip" --arg p "$port" --arg u "$username" --arg pw "$password" \
         '{"name":$n,"type":"socks5","server":$s,"port":($p|tonumber),"username":$u,"password":$pw}')
-    _add_node_to_yaml "$proxy_json"
-    _success "SOCKS5 节点添加成功!"
+    _add_node_to_yaml "$proxy_json" || return 1
+    _info "SOCKS5 节点配置已写入，等待服务校验..."
     _show_node_link "socks" "$name" "$display_ip" "$port" "$tag" "$username" "$password"
 }
 
@@ -4576,19 +4687,25 @@ _apply_dns_config() {
     if ! jq --argjson server "$server_json" --arg strategy "$dns_strategy" '
         .dns = {
             "servers": [$server],
+            "final": "dns-local",
             "strategy": $strategy
         }
         | .route = (.route // {})
-        | .route.default_domain_resolver = {"server": "dns-local"}
+        | .route.default_domain_resolver = {"server": "dns-local", "strategy": $strategy}
     ' "$CONFIG_FILE" > "$tmp_file"; then
         _error "生成 DNS 配置失败。"
         rm -f "$tmp_file"
         return 1
     fi
 
-    check_result=$(${SINGBOX_BIN} check -c "$tmp_file" 2>&1)
+    _ensure_relay_config || {
+        _error "中转配置不存在或无效，DNS 配置未修改。"
+        rm -f "$tmp_file"
+        return 1
+    }
+    check_result=$(_check_combined_config_files "$SINGBOX_BIN" "$tmp_file" "$RELAY_CONFIG_FILE" 2>&1)
     if [ $? -ne 0 ]; then
-        _error "新的 DNS 配置未通过 sing-box 校验，原配置未修改："
+        _error "新的 DNS 配置未通过 config.json + relay.json 组合校验，原配置未修改："
         echo "$check_result"
         rm -f "$tmp_file"
         return 1
@@ -4600,8 +4717,14 @@ _apply_dns_config() {
         return 1
     fi
 
-    _success "DNS 配置已保存，备份文件：${backup_file}"
-    _manage_service "restart"
+    if ! _manage_service "restart"; then
+        _error "DNS 配置已写入但服务重启失败，正在恢复旧配置。"
+        mv "$backup_file" "$CONFIG_FILE" 2>/dev/null || true
+        _manage_service "restart" >/dev/null 2>&1 || true
+        return 1
+    fi
+    _success "DNS 配置已保存并通过服务重启校验，备份文件：${backup_file}"
+    return 0
 }
 
 _dns_config_menu() {
@@ -4852,6 +4975,13 @@ _modify_port() {
     fi
     
     _info "正在修改端口: ${old_port} -> ${new_port}"
+
+    local modify_state_dir="/tmp/singbox-port-state.$$"
+    if ! _snapshot_node_state "$modify_state_dir"; then
+        _error "无法创建端口修改前的配置快照，已取消操作。"
+        rm -rf "$modify_state_dir"
+        return 1
+    fi
     
     # 1. 修改 config.json 主节点端口（按 tag 精确匹配，避免过滤 hop 子节点后索引错位）
     _atomic_modify_json "$CONFIG_FILE" "(.inbounds[] | select(.tag == \"$tag_to_modify\") | .listen_port) = $new_port" || return
@@ -5026,8 +5156,16 @@ _modify_port() {
         fi
     fi
     
-    _success "端口修改成功: ${old_port} -> ${new_port}"
-    _manage_service "restart"
+    if _manage_service "restart" && _verify_service_ready "$new_port" "any"; then
+        rm -rf "$modify_state_dir"
+        _success "端口修改成功，服务已重新加载并确认端口监听: ${old_port} -> ${new_port}"
+    else
+        _error "端口修改失败：服务重启或新端口监听校验未通过，正在恢复旧配置。"
+        _restore_node_state "$modify_state_dir"
+        _manage_service "restart" >/dev/null 2>&1 || true
+        rm -rf "$modify_state_dir"
+        return 1
+    fi
 }
 
 # --- 更新管理脚本 ---
@@ -5202,9 +5340,14 @@ _modify_sni() {
         fi
     fi
 
+    if ! _manage_service "restart"; then
+        _error "SNI 已修改但服务重启失败，正在恢复旧配置。"
+        _rollback_sni_change
+        _manage_service "restart" >/dev/null 2>&1 || true
+        return 1
+    fi
     rm -f "$backup_file" "${cert_path}.bak_sni" "${key_path}.bak_sni" 2>/dev/null
-    _success "SNI 修改成功: ${old_sni} -> ${new_sni}"
-    _manage_service "restart"
+    _success "SNI 修改成功，服务已重新加载: ${old_sni} -> ${new_sni}"
 
     local updated_link=$(jq -r ".\"$tag_to_modify\".share_link // \"\"" "$METADATA_FILE" 2>/dev/null)
     if [ -n "$updated_link" ]; then
@@ -5379,6 +5522,16 @@ _sni_optimizer_menu() {
     _info "通过验证后可用于：主菜单 [5] 修改节点 SNI，或 [18] 中转菜单 [7] 修改中转入口 SNI。"
 }
 
+_download_update_file() {
+    local url="$1" destination="$2"
+    # Alpine 的 BusyBox wget 在部分镜像上会静默吞掉 TLS/HTTP 错误；优先使用
+    # curl 的 fail-fast 模式，wget 仅作为没有 curl 的回退。
+    if command -v curl >/dev/null 2>&1 && curl -fsSL --retry 2 --connect-timeout 8 --max-time 60 "$url" -o "$destination"; then
+        return 0
+    fi
+    command -v wget >/dev/null 2>&1 && wget -qO "$destination" "$url"
+}
+
 _update_script() {
     _info "--- 更新脚本 ---"
     
@@ -5390,14 +5543,19 @@ _update_script() {
 
     # 更新主脚本。时间戳查询参数用于绕过代理/CDN 的旧文件缓存。
     _info "正在从 GitHub 下载最新版本..."
-    local temp_script_path="${SELF_SCRIPT_PATH}.tmp"
+    local temp_script_path
+    temp_script_path=$(mktemp "${SELF_SCRIPT_PATH}.tmp.XXXXXX") || {
+        _error "无法创建更新临时文件，请检查脚本目录权限。"
+        return 1
+    }
     local cache_bust
     local main_script_url
     local downloaded_version
+    local main_updated=false
     cache_bust=$(date +%s)
     main_script_url="${SCRIPT_UPDATE_URL}?v=${cache_bust}"
     
-    if wget -qO "$temp_script_path" "$main_script_url"; then
+    if _download_update_file "$main_script_url" "$temp_script_path"; then
         if [ ! -s "$temp_script_path" ]; then
             _error "主脚本下载失败或文件为空！"
             rm -f "$temp_script_path"
@@ -5415,10 +5573,27 @@ _update_script() {
             rm -f "$temp_script_path"
             return 1
         fi
+
+        if [[ "$downloaded_version" =~ ^[0-9]+$ && "$SCRIPT_VERSION" =~ ^[0-9]+$ ]] \
+            && [ "$downloaded_version" -lt "$SCRIPT_VERSION" ]; then
+            _warning "远端脚本版本 v${downloaded_version} 低于当前 v${SCRIPT_VERSION}，已拒绝降级覆盖。"
+            rm -f "$temp_script_path"
+            return 1
+        fi
         
-        chmod +x "$temp_script_path"
-        mv "$temp_script_path" "$SELF_SCRIPT_PATH"
-        _success "主脚本更新成功：v${SCRIPT_VERSION} -> v${downloaded_version}"
+        if cmp -s "$temp_script_path" "$SELF_SCRIPT_PATH"; then
+            rm -f "$temp_script_path"
+            _info "主脚本已是最新版 (v${SCRIPT_VERSION})，内容没有变化。"
+        else
+            chmod +x "$temp_script_path"
+            mv "$temp_script_path" "$SELF_SCRIPT_PATH"
+            main_updated=true
+            if [ "$downloaded_version" = "$SCRIPT_VERSION" ]; then
+                _success "主脚本内容已更新（版本号保持 v${downloaded_version}）。"
+            else
+                _success "主脚本更新成功：v${SCRIPT_VERSION} -> v${downloaded_version}"
+            fi
+        fi
     else
         _error "主脚本下载失败！请检查网络或 GitHub 链接。"
         rm -f "$temp_script_path"
@@ -5432,6 +5607,7 @@ _update_script() {
         local script_url="${GITHUB_RAW_BASE}/${script_name}?v=${cache_bust}"
         local temp_sub_path="${SINGBOX_DIR}/.${script_name}.tmp.$$"
         local updated=false
+        local download_ok=false
         local target_path
         local target_paths=("${SINGBOX_DIR}/${script_name}")
 
@@ -5443,13 +5619,17 @@ _update_script() {
         fi
 
         _info "正在下载子脚本: ${script_name}..."
-        if wget -qO "$temp_sub_path" "$script_url" \
+        if _download_update_file "$script_url" "$temp_sub_path" \
             && [ -s "$temp_sub_path" ] \
             && head -n 1 "$temp_sub_path" | grep -q '^#!/bin/bash' \
             && bash -n "$temp_sub_path" 2>/dev/null; then
+            download_ok=true
             chmod +x "$temp_sub_path"
             for target_path in "${target_paths[@]}"; do
                 mkdir -p "$(dirname "$target_path")" 2>/dev/null || continue
+                if [ -f "$target_path" ] && cmp -s "$temp_sub_path" "$target_path"; then
+                    continue
+                fi
                 if cp "$temp_sub_path" "${target_path}.tmp.$$" \
                     && chmod +x "${target_path}.tmp.$$" \
                     && mv "${target_path}.tmp.$$" "$target_path"; then
@@ -5463,6 +5643,8 @@ _update_script() {
 
         if [ "$updated" = true ]; then
             _success "子脚本 (${script_name}) 更新成功。"
+        elif [ "$download_ok" = true ]; then
+            _info "子脚本 (${script_name}) 已是最新，内容没有变化。"
         else
             _warning "子脚本 ${script_name} 下载失败或校验失败，保留现有文件。"
         fi
@@ -5471,7 +5653,11 @@ _update_script() {
     # 更新 yq 工具（如果缺失或版本过旧）
     _install_yq
     
-    _success "所有脚本组件已更新至最新版 (v${downloaded_version})！"
+    if [ "$main_updated" = true ]; then
+        _success "脚本更新检查完成，主脚本内容已刷新至 v${downloaded_version}。"
+    else
+        _info "脚本更新检查完成，主脚本当前已是 v${downloaded_version}。"
+    fi
     _info "请重新运行脚本以应用所有变更："
     echo -e "${YELLOW}bash ${SELF_SCRIPT_PATH}${NC}"
     exit 0
@@ -6308,6 +6494,14 @@ _batch_create_nodes() {
     done
 
     # 4. 执行安装循环
+    local state_dir="/tmp/singbox-batch-state.$$"
+    if ! _snapshot_node_state "$state_dir"; then
+        _error "无法创建批量创建前的配置快照，已取消操作。"
+        rm -rf "$state_dir"
+        return 1
+    fi
+    local batch_failed=false
+    local created_ports=()
     local bulk_idx=0
     local proto_array=($proto_ids)
     for i in "${!proto_array[@]}"; do
@@ -6321,7 +6515,11 @@ _batch_create_nodes() {
                 export BATCH_MODE="true"
                 export BATCH_PORT="$current_port"
                 export BATCH_SS_VARIANT="$v"
-                _add_shadowsocks_menu
+                if ! _add_shadowsocks_menu; then
+                    batch_failed=true
+                else
+                    created_ports+=("$current_port")
+                fi
                 ((bulk_idx++))
             done
         else
@@ -6333,36 +6531,73 @@ _batch_create_nodes() {
             export BATCH_HY2_OBFS="$hy2_obfs"
             export BATCH_HY2_HOP="$hy2_hop_range"
 
+            local action_result=0
             case $pid in
-                1) _add_vless_reality ;;
-                2) _add_vless_ws_tls ;;
-                3) _add_trojan_ws_tls ;;
-                4) _add_vless_grpc_tls ;;
-                5) _add_anytls ;;
-                6) _add_hysteria2 ;;
-                7) _add_tuic ;;
-                9) _add_vless_tcp ;;
-                10) _add_socks ;;
+                1) _add_vless_reality; action_result=$? ;;
+                2) _add_vless_ws_tls; action_result=$? ;;
+                3) _add_trojan_ws_tls; action_result=$? ;;
+                4) _add_vless_grpc_tls; action_result=$? ;;
+                5) _add_anytls; action_result=$? ;;
+                6) _add_hysteria2; action_result=$? ;;
+                7) _add_tuic; action_result=$? ;;
+                9) _add_vless_tcp; action_result=$? ;;
+                10) _add_socks; action_result=$? ;;
             esac
+            if [ "$action_result" -ne 0 ]; then
+                batch_failed=true
+            else
+                created_ports+=("$current_port")
+            fi
             ((bulk_idx++))
         fi
     done
 
     unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT BATCH_ANYTLS_MODE BATCH_IP BATCH_GRPC_TLS_DOMAIN BATCH_GRPC_SERVICE_NAME
-    
+
+    if [ "$batch_failed" = true ] || [ "${#created_ports[@]}" -eq 0 ]; then
+        _error "批量创建失败：至少一个节点配置写入未完成，正在恢复创建前配置。"
+        _restore_node_state "$state_dir"
+        _manage_service restart >/dev/null 2>&1 || true
+        rm -rf "$state_dir"
+        return 1
+    fi
+
+    _info "批量配置已写入，正在检查合并配置、重启服务和端口监听..."
+    local service_ready=true
+    if ! _manage_service restart; then
+        service_ready=false
+    else
+        local check_port
+        for check_port in "${created_ports[@]}"; do
+            if ! _verify_service_ready "$check_port" "any"; then
+                _error "端口 ${check_port} 未通过服务监听校验。"
+                service_ready=false
+                break
+            fi
+        done
+    fi
+
+    if [ "$service_ready" != true ]; then
+        _error "批量创建失败：服务重启或端口监听校验未通过，正在恢复创建前配置。"
+        _restore_node_state "$state_dir"
+        _manage_service restart >/dev/null 2>&1 || true
+        rm -rf "$state_dir"
+        return 1
+    fi
+
+    rm -rf "$state_dir"
     echo ""
     echo -e "${YELLOW}══════════════════ 批量创建完成提示 ══════════════════${NC}"
-    _success "所有节点已按直连模式部署完毕。"
-    _info "所有批量节点已就绪，您可以运行 sb 查看具体配置。"
+    _success "所有批量节点均已通过服务校验并确认端口监听。"
+    _info "您可以运行 sb 查看具体配置。"
     echo -e "${YELLOW}══════════════════════════════════════════════════════${NC}"
-
-    _success "批量创建任务已全部完成。"
-    _manage_service restart
+    return 0
 }
 
 _show_add_node_menu() {
     local needs_restart=false
     local action_result
+    local state_dir="/tmp/singbox-node-state.$$"
     [ -z "$server_ip" ] && _init_server_ip
     clear
     echo -e "${CYAN}"
@@ -6401,6 +6636,21 @@ _show_add_node_menu() {
         return
     fi
 
+    if [ "$choice" = "0" ]; then
+        return
+    fi
+    if [ "$choice" = "11" ]; then
+        _batch_create_nodes
+        return
+    fi
+
+    rm -rf "$state_dir"
+    if ! _snapshot_node_state "$state_dir"; then
+        _error "无法创建节点变更快照，已取消操作。"
+        rm -rf "$state_dir"
+        return 1
+    fi
+
     case $choice in
         1) _add_vless_reality; action_result=$? ;;
         2) _add_vless_ws_tls; action_result=$? ;;
@@ -6422,9 +6672,46 @@ _show_add_node_menu() {
     fi
 
     if [ "$needs_restart" = true ]; then
-        _info "配置已更新"
-        _manage_service "restart"
+        local new_node_info new_tag new_port
+        new_node_info=$(jq -r --slurpfile old "$state_dir/config.json" '
+            .inbounds[] as $new
+            | select((($old[0].inbounds // []) | map(.tag) | index($new.tag)) | not)
+            | [$new.tag, ($new.listen_port|tostring)] | @tsv
+        ' "$CONFIG_FILE" 2>/dev/null)
+        if [ -z "$new_node_info" ]; then
+            _error "节点函数未生成可验证的入站端口，正在恢复创建前配置。"
+            _restore_node_state "$state_dir"
+            rm -rf "$state_dir"
+            return 1
+        fi
+        _info "配置已写入，正在检查合并配置、重启服务和监听端口..."
+        local service_ready=true
+        if ! _manage_service "restart"; then
+            service_ready=false
+        else
+            while IFS=$'\t' read -r new_tag new_port; do
+                [ -z "$new_port" ] && continue
+                if ! _verify_service_ready "$new_port" "any"; then
+                    _error "端口 ${new_port} 未通过服务监听校验。"
+                    service_ready=false
+                    break
+                fi
+            done <<< "$new_node_info"
+        fi
+        if [ "$service_ready" != true ]; then
+            _error "节点创建失败：服务重启或端口监听校验未通过，正在恢复创建前配置。"
+            _restore_node_state "$state_dir"
+            _manage_service "restart" >/dev/null 2>&1 || true
+            rm -rf "$state_dir"
+            return 1
+        fi
+        _success "节点配置已加载，服务运行正常，新增端口均已监听。"
+    else
+        _error "节点配置写入失败，未执行服务重启。"
+        rm -rf "$state_dir"
+        return 1
     fi
+    rm -rf "$state_dir"
 }
 
 # --- 脚本入口 ---

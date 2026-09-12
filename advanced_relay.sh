@@ -1065,8 +1065,13 @@ _finalize_relay_setup() {
         _error "配置验证失败，已回滚"; return 1
     fi
     
-    _success "配置已更新！正在重启服务..."
-    _manage_service restart
+    _info "配置已写入，正在重启并校验服务..."
+    if ! _manage_service restart; then
+        mv "${CONFIG_FILE}.bak" "$CONFIG_FILE" 2>/dev/null || true
+        _error "中转服务重启失败，已恢复创建前配置。"
+        _manage_service restart >/dev/null 2>&1 || true
+        return 1
+    fi
     _save_nftables_rules
     
     # 3. 存储链接信息与扩展参数清理信息
@@ -1074,7 +1079,12 @@ _finalize_relay_setup() {
     local metadata=$(jq -n --arg link "$link" --arg created "$(date '+%Y-%m-%d %H:%M:%S')" --arg relay_type "$relay_type" \
         --arg landing_type "$dest_type" --arg landing_addr "${dest_addr}:${dest_port}" --arg node_name "$node_name" --arg hop "$port_range" \
         '{link: $link, created_at: $created, relay_type: $relay_type, landing_type: $landing_type, landing_addr: $landing_addr, node_name: $node_name} | if $hop != "" then .port_hopping = $hop else . end')
-    jq --arg tag "$inbound_tag" --argjson meta "$metadata" '.[$tag] = $meta' "$LINKS_FILE" > "${LINKS_FILE}.tmp" && mv "${LINKS_FILE}.tmp" "$LINKS_FILE"
+    if ! jq --arg tag "$inbound_tag" --argjson meta "$metadata" '.[$tag] = $meta' "$LINKS_FILE" > "${LINKS_FILE}.tmp" || ! mv "${LINKS_FILE}.tmp" "$LINKS_FILE"; then
+        mv "${CONFIG_FILE}.bak" "$CONFIG_FILE" 2>/dev/null || true
+        _error "中转链接元数据写入失败，已恢复创建前配置。"
+        _manage_service restart >/dev/null 2>&1 || true
+        return 1
+    fi
     _log_operation "CREATE_RELAY" "Type: $relay_type, Port: $listen_port, Landing: ${dest_type}@${dest_addr}:${dest_port}"
     
     # 4. 添加到中转机专用 YAML 配置 (复用上方已获取的 relay_server_ip)
@@ -1105,10 +1115,16 @@ _finalize_relay_setup() {
         proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg pw "$password" --arg sn "$sn" \
             '{name:$n,type:"anytls",server:$s,port:($p|tonumber),password:$pw,"client-fingerprint":"chrome",udp:true,sni:$sn,alpn:["h2","http/1.1"],"skip-cert-verify":true}')
     fi
-    [ -n "$proxy_json" ] && _add_node_to_relay_yaml "$proxy_json"
+    if [ -n "$proxy_json" ] && ! _add_node_to_relay_yaml "$proxy_json"; then
+        mv "${CONFIG_FILE}.bak" "$CONFIG_FILE" 2>/dev/null || true
+        _error "中转 Clash 配置写入失败，已恢复创建前配置。"
+        _manage_service restart >/dev/null 2>&1 || true
+        return 1
+    fi
+    rm -f "${CONFIG_FILE}.bak"
     
     echo -e "${YELLOW}═══════════════════ 配置成功 ═══════════════════${NC}"
-    _success "中转配置已生效！"
+    _success "中转配置已生效，服务已重启并通过配置校验！"
     echo -e "  节点名称: ${GREEN}$node_name${NC}"
     echo -e "  中转协议: ${CYAN}$relay_type${NC}"
     echo -e "  落地地址: ${CYAN}${dest_addr}:${dest_port}${NC}"
@@ -1431,7 +1447,16 @@ _modify_relay_port() {
     done
     
     _info "正在修改端口..."
-    _atomic_modify_json "$CONFIG_FILE" "(.inbounds[] | select(.tag == \"$in_tag\") | .listen_port) = ($new_port|tonumber)"
+    local port_backup_file="${CONFIG_FILE}.bak_port_$$"
+    cp "$CONFIG_FILE" "$port_backup_file" || {
+        _error "无法创建端口修改前的配置备份。"
+        return 1
+    }
+    if ! _atomic_modify_json "$CONFIG_FILE" "(.inbounds[] | select(.tag == \"$in_tag\") | .listen_port) = ($new_port|tonumber)"; then
+        mv "$port_backup_file" "$CONFIG_FILE" 2>/dev/null || true
+        _error "中转端口配置写入失败，已恢复旧配置。"
+        return 1
+    fi
     
     # [修复] 3. 同步更新 relay_links.json 中的链接端口与节点说明
     local old_node_name=""
@@ -1496,9 +1521,15 @@ _modify_relay_port() {
     # 记录操作
     _log_operation "MODIFY_RELAY_PORT" "Tag: $in_tag, Old Port: $old_port, New Port: $new_port"
 
-    _manage_service restart
+    if ! _manage_service restart; then
+        _error "中转端口修改后服务重启失败，正在恢复旧配置。"
+        mv "$port_backup_file" "$CONFIG_FILE" 2>/dev/null || true
+        _manage_service restart >/dev/null 2>&1 || true
+        return 1
+    fi
+    rm -f "$port_backup_file"
     _save_nftables_rules
-    _success "服务已重启"
+    _success "中转端口修改成功，服务已重新加载"
     read -p "  按回车键继续..."
 }
 
@@ -1635,13 +1666,16 @@ _modify_relay_sni() {
         _info "YAML 配置 SNI 已同步: ${node_name}"
     fi
 
-    rm -f "$backup_file" "${cert_path}.bak_sni" "${key_path}.bak_sni" 2>/dev/null
-
     _log_operation "MODIFY_RELAY_SNI" "Tag: $in_tag, Old SNI: $old_sni, New SNI: $new_sni"
 
-    _success "SNI 修改成功: ${old_sni} -> ${new_sni}"
-    _manage_service restart
-    _success "服务已重启"
+    if ! _manage_service restart; then
+        _error "中转 SNI 已修改但服务重启失败，正在恢复旧配置。"
+        _rollback_relay_sni
+        _manage_service restart >/dev/null 2>&1 || true
+        return 1
+    fi
+    rm -f "$backup_file" "${cert_path}.bak_sni" "${key_path}.bak_sni" 2>/dev/null
+    _success "SNI 修改成功，服务已重新加载: ${old_sni} -> ${new_sni}"
 
     local updated_link=$(jq -r ".\"$in_tag\".link // \"\"" "$LINKS_FILE" 2>/dev/null)
     if [ -n "$updated_link" ]; then
