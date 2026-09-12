@@ -5429,32 +5429,43 @@ _update_script() {
     local sub_scripts=("advanced_relay.sh" "parser.sh" "xray_manager.sh")
     
     for script_name in "${sub_scripts[@]}"; do
+        local script_url="${GITHUB_RAW_BASE}/${script_name}?v=${cache_bust}"
+        local temp_sub_path="${SINGBOX_DIR}/.${script_name}.tmp.$$"
         local updated=false
-        # 多路径检测：1. 辅助目录 2. 当前脚本同级目录
-        local paths_to_check=("${SINGBOX_DIR}/${script_name}" "${SCRIPT_DIR}/${script_name}")
-        
-        for script_path in "${paths_to_check[@]}"; do
-            if [ -f "$script_path" ]; then
-                local script_url="${GITHUB_RAW_BASE}/${script_name}?v=${cache_bust}"
-                local temp_sub_path="${script_path}.tmp"
-                
-                _info "正在更新子脚本: ${script_name} -> ${script_path}..."
-                if wget -qO "$temp_sub_path" "$script_url"; then
-                    if [ -s "$temp_sub_path" ]; then
-                        chmod +x "$temp_sub_path"
-                        mv "$temp_sub_path" "$script_path"
-                        updated=true
-                        break
-                    else
-                        rm -f "$temp_sub_path"
-                    fi
+        local target_path
+        local target_paths=("${SINGBOX_DIR}/${script_name}")
+
+        # 子脚本不依赖“当前是否已存在”：首次更新也必须下载到规范目录。
+        # 如果当前入口目录还有旧副本，则一并覆盖，避免运行时优先命中旧文件。
+        if [ "${SCRIPT_DIR}/${script_name}" != "${SINGBOX_DIR}/${script_name}" ] \
+            && [ -f "${SCRIPT_DIR}/${script_name}" ]; then
+            target_paths+=("${SCRIPT_DIR}/${script_name}")
+        fi
+
+        _info "正在下载子脚本: ${script_name}..."
+        if wget -qO "$temp_sub_path" "$script_url" \
+            && [ -s "$temp_sub_path" ] \
+            && head -n 1 "$temp_sub_path" | grep -q '^#!/bin/bash' \
+            && bash -n "$temp_sub_path" 2>/dev/null; then
+            chmod +x "$temp_sub_path"
+            for target_path in "${target_paths[@]}"; do
+                mkdir -p "$(dirname "$target_path")" 2>/dev/null || continue
+                if cp "$temp_sub_path" "${target_path}.tmp.$$" \
+                    && chmod +x "${target_path}.tmp.$$" \
+                    && mv "${target_path}.tmp.$$" "$target_path"; then
+                    updated=true
                 else
-                    rm -f "$temp_sub_path"
+                    rm -f "${target_path}.tmp.$$"
                 fi
-            fi
-        done
-        
-        [ "$updated" = true ] && _success "子脚本 (${script_name}) 更新成功。" || _warning "子脚本 ${script_name} 未发现运行中实例或下载失败，跳过更新。"
+            done
+        fi
+        rm -f "$temp_sub_path"
+
+        if [ "$updated" = true ]; then
+            _success "子脚本 (${script_name}) 更新成功。"
+        else
+            _warning "子脚本 ${script_name} 下载失败或校验失败，保留现有文件。"
+        fi
     done
     
     # 更新 yq 工具（如果缺失或版本过旧）
