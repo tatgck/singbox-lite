@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is **singbox-lite**, a comprehensive sing-box + Xray dual-core management script suite for Linux servers. It provides automated node creation, relay/transit configurations, third-party node import, port forwarding, Argo tunnels, and Clash/Mihomo configuration export.
 
-**Current script versions**: `singbox.sh v24`, `advanced_relay.sh`, `parser.sh`, `xray_manager.sh`
+**Current script versions**: `singbox.sh v25`, `advanced_relay.sh`, `parser.sh`, `xray_manager.sh`
 
-Note: The README.md describes v28 features (latest upstream), while this fork currently tracks v24 scripts with additional fixes applied.
+Note: The README.md describes v28 features (latest upstream), while this fork currently tracks v25 scripts with additional fixes applied.
 
 ## Repository Structure
 
@@ -172,7 +172,7 @@ git push origin main
 
 ## Notes for Future Sessions
 
-- README.md describes v28 features; current scripts are v24 with fixes
+- README.md describes v28 features; current scripts are v25 with fixes
 - Parser supports strict protocol-specific parsing (no auto-detection fallback)
 - All scripts share a state lock mechanism at `/var/lock/singbox_relay.lock`
 - Atomic writes use temp files + `mv` for JSON/YAML updates

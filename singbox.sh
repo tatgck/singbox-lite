@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="24"
+export SCRIPT_VERSION="25"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -563,19 +563,54 @@ _manage_service() {
 # 智能包管理
 _pkg_install() {
     local pkgs="$*"
+    local rc
     [ -z "$pkgs" ] && return 0
     if command -v apk &>/dev/null; then
         apk add --no-cache $pkgs >/dev/null 2>&1
     elif command -v apt-get &>/dev/null; then
         # 全新 LXC/容器上 apt 缓存可能为空，必须先 update
         if [ ! -d "/var/lib/apt/lists" ] || [ "$(ls -A /var/lib/apt/lists/ 2>/dev/null | wc -l)" -le 1 ]; then
-            apt-get update -qq >/dev/null 2>&1
+            apt-get -o DPkg::Lock::Timeout=120 update -qq >/dev/null 2>&1
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+                if [ "$rc" -eq 137 ]; then
+                    _warn "apt-get update 被系统终止（可能是内存不足）；停止重试。"
+                else
+                    _warn "apt-get update 失败（退出码 ${rc}）；请检查网络、软件源或 apt 锁占用。"
+                fi
+                return "$rc"
+            fi
         fi
-        DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || {
-            # 兜底：如果安装失败，强制刷新索引后重试
-            apt-get update -qq >/dev/null 2>&1
-            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
-        }
+        # 不安装推荐包，减少低内存 VPS 的下载量、解包量和安装时间。
+        # Debian/Ubuntu 首次启动时 apt-daily 可能持有 dpkg 锁；等待最多 120 秒再失败。
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=120 $pkgs >/dev/null 2>&1
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            return 0
+        elif [ "$rc" -eq 137 ]; then
+            _warn "apt-get install 被系统强制终止（SIGKILL，常见原因是 VPS 内存不足）；不再刷新索引或重试。"
+            return "$rc"
+        fi
+
+        # 非 OOM 类错误（例如索引过期）才刷新一次索引后重试。
+        _warn "apt-get install 失败（退出码 ${rc}），刷新软件索引后重试一次..."
+        apt-get -o DPkg::Lock::Timeout=120 update -qq >/dev/null 2>&1
+        rc=$?
+        if [ "$rc" -eq 137 ]; then
+            _warn "apt-get update 被系统强制终止（SIGKILL，常见原因是 VPS 内存不足）；停止重试。"
+            return "$rc"
+        elif [ "$rc" -ne 0 ]; then
+            _warn "apt-get update 失败（退出码 ${rc}）。"
+            return "$rc"
+        fi
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=120 $pkgs >/dev/null 2>&1
+        rc=$?
+        if [ "$rc" -eq 137 ]; then
+            _warn "apt-get install 重试时再次被系统强制终止（SIGKILL）；请先释放/增加 VPS 内存后再运行。"
+        elif [ "$rc" -ne 0 ]; then
+            _warn "apt-get install 重试失败（退出码 ${rc}）。"
+        fi
+        return "$rc"
     elif command -v yum &>/dev/null; then yum install -y $pkgs >/dev/null 2>&1
     elif command -v dnf &>/dev/null; then dnf install -y $pkgs >/dev/null 2>&1
     else
@@ -807,16 +842,33 @@ _install_dependencies() {
     fi
 
     _info "正在安装核心依赖..."
-    _pkg_install $core_pkgs
+    if ! _pkg_install $core_pkgs; then
+        _error "核心依赖安装失败，停止后续安装，避免在 VPS 资源不足时反复调用包管理器。"
+        _error "如果日志包含 Killed/SIGKILL，请检查内存和 OOM 记录（free -h; dmesg -T | tail -n 50），释放空间或增加 swap 后重试。"
+        exit 1
+    fi
     
     _info "正在安装可选依赖..."
-    _pkg_install $optional_pkgs 2>/dev/null || {
-        # 可选依赖批量安装失败时逐个尝试
-        _warn "部分可选依赖批量安装遇到冲突，正在逐个重试..."
-        for pkg in $optional_pkgs; do
-            _pkg_install "$pkg" 2>/dev/null || true
-        done
-    }
+    if _pkg_install $optional_pkgs 2>/dev/null; then
+        :
+    else
+        # SIGKILL 往往表示 OOM；不能逐包重复启动 apt，否则会进一步消耗资源。
+        local optional_rc=$?
+        if [ "$optional_rc" -eq 137 ]; then
+            _warn "可选依赖安装被系统强制终止；跳过逐包重试，继续检查已有工具。"
+        else
+            # 可选依赖批量安装失败时逐个尝试
+            _warn "部分可选依赖批量安装失败，正在逐个尝试..."
+            for pkg in $optional_pkgs; do
+                _pkg_install "$pkg" 2>/dev/null
+                optional_rc=$?
+                [ "$optional_rc" -eq 137 ] && {
+                    _warn "安装 ${pkg} 时遇到 SIGKILL，停止其余可选依赖重试。"
+                    break
+                }
+            done
+        fi
+    fi
     
     _install_yq
 
