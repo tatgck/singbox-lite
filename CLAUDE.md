@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is **singbox-lite**, a comprehensive sing-box + Xray dual-core management script suite for Linux servers. It provides automated node creation, relay/transit configurations, third-party node import, port forwarding, Argo tunnels, and Clash/Mihomo configuration export.
 
-**Current script versions**: `singbox.sh v25`, `advanced_relay.sh`, `parser.sh`, `xray_manager.sh`
+**Current script versions**: `singbox.sh v27`, `advanced_relay.sh`, `parser.sh`, `xray_manager.sh`
 
-Note: The README.md describes v28 features (latest upstream), while this fork currently tracks v25 scripts with additional fixes applied.
+Note: The README.md describes this fork's v27 main script with additional fixes applied.
 
 ## Repository Structure
 
@@ -125,6 +125,7 @@ Three new features:
 - Alpine Linux 3.21 uses the OpenRC path; node readiness requires `rc-service sing-box status`, a live sing-box process, and `ss` from the `iproute2` package, with a short retry window for delayed socket binding.
 - The 1.14 DNS path now also sets `dns.final` to `dns-local`; DNS changes are checked against the combined `config.json + relay.json` before replacing the active configuration and are rolled back if service restart fails.
 - The updater uses fail-fast `curl` with a `wget` fallback and refuses to overwrite a newer local script with an older remote version.
+- SNI 优选 v27 supports VPS-local, China remote, and combined measurements. It limits source selection to five entries, separates selected DNS reference points from actual Globalping probes, applies bounded polling and failure handling, and reports remote ping latency to the VPS with probe coordinates. Remote results verify TLS reachability; they do not substitute for final client-side HTTP/2/Reality validation.
 
 ## Common Development Tasks
 
@@ -172,7 +173,7 @@ git push origin main
 
 ## Notes for Future Sessions
 
-- README.md describes v28 features; current scripts are v25 with fixes
+- README.md describes the current v27 main script with fixes
 - Parser supports strict protocol-specific parsing (no auto-detection fallback)
 - All scripts share a state lock mechanism at `/var/lock/singbox_relay.lock`
 - Atomic writes use temp files + `mv` for JSON/YAML updates

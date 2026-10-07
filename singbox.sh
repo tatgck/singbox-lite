@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="25"
+export SCRIPT_VERSION="27"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -5416,9 +5416,243 @@ _modify_sni() {
 # --- SNI 候选筛选（Reality/TLS 伪装域名）---
 # 优选标准参考 Reality 社区规范（XTLS/RealiTLScanner 项目思路）：
 #   目标域名需支持 TLS 1.3 + HTTP/2、直连可通、无跳转、非过于大众的域名
-# 本功能只验证“运行脚本的 VPS -> 域名”是否可完成 TLS 握手。
-# 它不能代表中国客户端到该域名的可达性，因此结果不能作为国内链路排名。
 # ============================================================
+
+# 国内线路参考目录：格式为 运营商|地区|DNS IP|经度|纬度|Globalping ASN。
+# DNS IP 用于当前 VPS 的连通性参考；真实的国内出发测试由 Globalping 运营商探针完成。
+_sni_source_catalog() {
+    cat <<'EOF'
+电信|成都|61.139.2.69|104.0663|30.6667|4134
+电信|北京|220.181.12.199|116.3971|39.9075|4134
+电信|上海|202.96.209.133|121.4689|31.2243|4134
+电信|广州|202.96.128.166|113.2646|23.1274|4134
+电信|合肥|61.132.163.68|117.2808|31.8639|4134
+电信|厦门|218.85.152.99|118.0819|24.4798|4134
+电信|贵阳|202.98.192.67|106.7167|26.5833|4134
+电信|洛阳|222.88.88.88|112.4536|34.6836|4134
+电信|哈尔滨|219.147.198.230|126.6500|45.7500|4134
+电信|南京|218.2.2.2|118.7778|32.0617|4134
+电信|南昌|202.101.224.69|115.9333|28.5500|4134
+电信|天津|219.150.32.132|117.1767|39.1422|4134
+电信|昆明|222.172.200.68|102.7183|25.0389|4134
+联通|重庆|221.5.203.98|106.5528|29.5628|4837
+联通|成都|119.6.6.6|104.0663|30.6667|4837
+联通|北京|111.201.101.156|116.3971|39.9075|4837
+联通|深圳|210.21.196.6|114.1333|22.5333|4837
+联通|河北|202.99.160.68|115.2750|39.8897|4837
+联通|哈尔滨|202.97.224.69|126.6500|45.7500|4837
+联通|上海|140.207.198.6|121.4689|31.2243|4837
+联通|长春|202.98.0.68|125.3228|43.8800|4837
+联通|青岛|202.102.128.68|120.3719|36.0986|4837
+联通|广州|120.80.88.88|113.2646|23.1274|4837
+联通|杭州|221.12.1.227|120.1614|30.2936|4837
+移动|北京|221.130.33.60|116.3971|39.9075|9808
+移动|上海|211.136.112.50|121.4689|31.2243|9808
+移动|广州|211.136.192.6|113.2646|23.1274|9808
+移动|成都|183.221.253.100|104.0663|30.6667|9808
+移动|南京|221.131.143.69|118.7778|32.0617|9808
+移动|合肥|211.138.180.2|117.2808|31.8639|9808
+移动|青岛|218.201.96.130|120.3719|36.0986|9808
+移动|太原|211.138.106.2|112.5615|37.8694|9808
+移动|济南|211.137.191.26|116.9972|36.6683|9808
+移动|杭州|211.140.13.188|120.1614|30.2936|9808
+移动|南昌|211.141.90.68|115.9333|28.5500|9808
+移动|西安|211.137.130.19|108.9286|34.2583|9808
+移动|海口|221.179.38.7|110.3417|20.0458|9808
+移动|郑州|211.138.30.66|113.6486|34.7578|9808
+移动|重庆|218.201.4.3|106.5531|29.5628|9808
+移动|贵州|211.139.5.29|110.6898|30.9969|9808
+EOF
+}
+
+# 通过 Globalping 从中国运营商探针发起测量；返回完整 JSON。
+_sni_globalping_city() {
+    case "$1" in
+        成都) echo Chengdu ;; 北京) echo Beijing ;; 上海) echo Shanghai ;;
+        广州) echo Guangzhou ;; 合肥) echo Hefei ;; 厦门) echo Xiamen ;;
+        贵阳) echo Guiyang ;; 洛阳) echo Luoyang ;; 哈尔滨) echo Harbin ;;
+        南京) echo Nanjing ;; 南昌) echo Nanchang ;; 天津) echo Tianjin ;;
+        昆明) echo Kunming ;; 重庆) echo Chongqing ;; 深圳) echo Shenzhen ;;
+        长春) echo Changchun ;; 青岛) echo Qingdao ;; 杭州) echo Hangzhou ;;
+        太原) echo Taiyuan ;; 济南) echo Jinan ;; 西安) echo "Xi'an" ;;
+        海口) echo Haikou ;; 郑州) echo Zhengzhou ;;
+        *) echo "" ;;
+    esac
+}
+
+_sni_globalping_measure() {
+    local measurement_type="$1" target="$2" locations_json="$3" fallback_json="${4:-}"
+    local payload response measurement_id data state i http_code response_file
+    payload=$(jq -nc --arg type "$measurement_type" --arg target "$target" --argjson locations "$locations_json" \
+        '{type:$type,target:$target,locations:$locations}') || return 1
+    response_file=$(mktemp /tmp/sni-globalping.XXXXXX) || return 1
+    http_code=$(curl -sS --connect-timeout 8 --max-time 15 -X POST \
+        -H 'content-type: application/json' -H 'user-agent: singbox-lite-sni/27' \
+        --data "$payload" -o "$response_file" -w '%{http_code}' \
+        'https://api.globalping.io/v1/measurements' 2>/dev/null)
+    if [ "$http_code" = 422 ] && [ -n "$fallback_json" ] && \
+       jq -e '.error.type == "no_probes_found"' "$response_file" >/dev/null 2>&1; then
+        _warn "所选城市缺少可用探针，回退到同运营商的中国探针；实际城市以结果为准。"
+        payload=$(jq -nc --arg type "$measurement_type" --arg target "$target" --argjson locations "$fallback_json" \
+            '{type:$type,target:$target,locations:$locations}') || { rm -f "$response_file"; return 1; }
+        http_code=$(curl -sS --connect-timeout 8 --max-time 15 -X POST \
+            -H 'content-type: application/json' -H 'user-agent: singbox-lite-sni/27' \
+            --data "$payload" -o "$response_file" -w '%{http_code}' \
+            'https://api.globalping.io/v1/measurements' 2>/dev/null)
+    fi
+    if [ "$http_code" != 202 ]; then
+        _warn "Globalping 创建测量失败（HTTP ${http_code:-网络错误}）。"
+        rm -f "$response_file"
+        return 1
+    fi
+    response=$(<"$response_file")
+    rm -f "$response_file"
+    response=$(printf '%s' "$response" | tr -d '\000-\010\013\014\016-\037')
+    measurement_id=$(echo "$response" | jq -r '.id // empty')
+    [ -n "$measurement_id" ] || return 1
+
+    data=""
+    state=""
+    # Globalping 的 HTTP 探针可能要等待目标首字节；总轮询窗口约 30 秒。
+    local deadline=$((SECONDS + 30))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        sleep 1
+        data=$(curl -fsS --connect-timeout 5 --max-time 6 \
+            "https://api.globalping.io/v1/measurements/${measurement_id}" 2>/dev/null) || continue
+        data=$(printf '%s' "$data" | tr -d '\000-\010\013\014\016-\037')
+        state=$(printf '%s' "$data" | jq -r '.status // empty' 2>/dev/null) || continue
+        [[ "$state" == "finished" || "$state" == "failed" ]] && break
+    done
+    [ "$state" = "finished" ] || return 1
+    printf '%s\n' "$data"
+}
+
+# 输出: 平均 TLS 毫秒<TAB>成功探针数<TAB>探针详情
+_sni_globalping_http() {
+    local data avg good details protocols requested
+    data=$(_sni_globalping_measure http "$1" "$2" "$3") || return 1
+    avg=$(echo "$data" | jq -r '
+        [.results[]? | select(.result.tls.protocol == "TLSv1.3") | .result.timings.tls // empty] |
+        if length > 0 then (add / length | floor | tostring) else empty end')
+    good=$(echo "$data" | jq -r '[.results[]? | select(.result.tls.protocol == "TLSv1.3") | .result.timings.tls // empty] | length')
+    [ -n "$avg" ] && [ "$good" -gt 0 ] 2>/dev/null || return 1
+    protocols=$(echo "$data" | jq -r '[.results[]? | select(.result.timings.tls != null) |
+        (.result.tls.protocol // "unknown")] | unique | join(",")')
+    requested=$(echo "$data" | jq -r '.probesCount // 0')
+    details=$(echo "$data" | jq -r '[.results[]? |
+        select(.result.timings.tls != null and .result.tls.protocol == "TLSv1.3") |
+        ((.probe.city // "?") + "/" + (.probe.network // "?") + " @ " +
+         ((.probe.longitude // 0)|tostring) + "," + ((.probe.latitude // 0)|tostring))] |
+        join("; ")')
+    # 第四列保留 TLS 协议版本；Globalping 当前不保证返回 HTTP/2 协商结果。
+    printf '%s\t%s\t%s\t%s\t%s\n' "$avg" "$good" "$details" "$protocols" "$requested"
+}
+
+_sni_globalping_ping_vps() {
+    local data="$1"
+    echo "$data" | jq -r '.results[]? |
+        (.probe.city // "?") + "/" + (.probe.network // "?") +
+        " ASN" + ((.probe.asn // 0)|tostring) +
+        " (" + ((.probe.longitude // 0)|tostring) + "," +
+        ((.probe.latitude // 0)|tostring) + "): " +
+        (if .result.stats.avg != null then
+            ((.result.stats.avg | floor | tostring) + "ms, loss " +
+             ((.result.stats.loss // 0)|tostring) + "%")
+         elif .result.status == "failed" then
+            ("ICMP 无结果（" + (.result.failureSource // "探针或目标") + "）")
+         else "无结果" end)'
+}
+
+_sni_choose_sources() {
+    local rows=() choice idx selected=() source_locations='[]' fallback_locations='[]'
+    local carrier city ip lon lat asn ping_state row selected_idx
+    SNI_SOURCE_LOCATIONS=''
+    SNI_SOURCE_COUNT=0
+    SNI_SOURCE_SELECTED_COUNT=0
+    SNI_SOURCE_LABEL=''
+    SNI_SOURCE_FALLBACK_LOCATIONS=''
+
+    while IFS= read -r row; do
+        rows+=("$row")
+    done < <(_sni_source_catalog)
+    echo ""
+    echo -e "${CYAN}国内出发点选择（最多 5 个）${NC}"
+    echo "DNS IP 仅作线路参考和本机 ping 检查；实际 HTTPS 测试使用 Globalping 的中国运营商探针。"
+    local n=1
+    for row in "${rows[@]}"; do
+        IFS='|' read -r carrier city ip lon lat asn <<< "$row"
+        printf '  %2d) %-4s %-5s %-15s (%s,%s)\n' "$n" "$carrier" "$city" "$ip" "$lon" "$lat"
+        n=$((n + 1))
+    done
+    echo ""
+    read -r -p "输入编号（逗号分隔，最多 5 个；直接回车使用三网各 1 个推荐点）: " choice
+    if [ -z "$choice" ]; then
+        choice="2,15,26"
+    fi
+    choice=${choice//,/ }
+    local requested_count=0
+    for idx in $choice; do
+        requested_count=$((requested_count + 1))
+    done
+    [ "$requested_count" -gt 5 ] && _warn "单次最多选择 5 个出发点，仅处理前 5 个有效编号。"
+
+    for idx in $choice; do
+        [[ "$idx" =~ ^[0-9]+$ ]] || continue
+        [ "$idx" -ge 1 ] && [ "$idx" -le "${#rows[@]}" ] || continue
+        local duplicate=false
+        for selected_idx in "${selected[@]}"; do
+            [ "$selected_idx" -eq "$idx" ] && duplicate=true
+        done
+        [ "$duplicate" = true ] && continue
+        selected+=("$idx")
+        [ "${#selected[@]}" -ge 5 ] && break
+    done
+    if [ "${#selected[@]}" -eq 0 ]; then
+        _warn "没有有效的出发点编号，已取消远程测试。"
+        SNI_SOURCE_LOCATIONS=''
+        SNI_SOURCE_COUNT=0
+        SNI_SOURCE_LABEL=''
+        SNI_SOURCE_SELECTED_COUNT=0
+        SNI_SOURCE_FALLBACK_LOCATIONS=''
+        return 1
+    fi
+
+    local seen_asn="" labels=""
+    for idx in "${selected[@]}"; do
+        IFS='|' read -r carrier city ip lon lat asn <<< "${rows[$((idx - 1))]}"
+        ping_state="未测试"
+        if command -v ping >/dev/null 2>&1 && ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
+            ping_state="可达"
+        elif command -v ping >/dev/null 2>&1; then
+            ping_state="不可达/禁 ICMP"
+        fi
+        echo "  已选: ${carrier} ${city} ${ip} (${lon},${lat})，本机 ping: ${ping_state}"
+        echo "       地图: https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=8/${lat}/${lon}"
+        labels="${labels}${labels:+；}${carrier}/${city} ${ip} (${lon},${lat})"
+        local globalping_city
+        globalping_city=$(_sni_globalping_city "$city")
+        if [ -n "$globalping_city" ]; then
+            source_locations=$(echo "$source_locations" | jq -c --argjson asn "$asn" --arg city "$globalping_city" \
+                '. + [{country:"CN",asn:$asn,city:$city,limit:1}]')
+        else
+            source_locations=$(echo "$source_locations" | jq -c --argjson asn "$asn" \
+                '. + [{country:"CN",asn:$asn,limit:1}]')
+        fi
+        case " $seen_asn " in
+            *" $asn "*) ;;
+            *)
+                fallback_locations=$(echo "$fallback_locations" | jq -c --argjson asn "$asn" \
+                    '. + [{country:"CN",asn:$asn,limit:1}]')
+                seen_asn="${seen_asn}${seen_asn:+ }${asn}"
+                ;;
+        esac
+    done
+    SNI_SOURCE_LOCATIONS="$source_locations"
+    SNI_SOURCE_FALLBACK_LOCATIONS="$fallback_locations"
+    SNI_SOURCE_COUNT=$(echo "$source_locations" | jq 'length')
+    SNI_SOURCE_SELECTED_COUNT="${#selected[@]}"
+    SNI_SOURCE_LABEL="$labels"
+}
 
 # 对单个域名做 3 轮 TLS 握手测试（读取全局 SNI_TLS13_FLAG 决定是否强制 TLS1.3）
 # 输出: avg_ms<TAB>jitter_ms<TAB>h2(✓/✗)<TAB>ok_rounds，有效轮次不足时无输出
@@ -5480,9 +5714,9 @@ _sni_optimizer_menu() {
     echo "  ║      SNI 优选（伪装域名测速）         ║"
     echo "  ╚═══════════════════════════════════════╝"
     echo -e "${NC}"
-    echo "  筛选标准：TLS 1.3 + HTTP/2、VPS 侧直连可通、握手稳定。"
-    echo "  测试方法：每个域名 3 轮 TLS 握手测试（已排除 DNS 波动）。"
-    _warn "重要：测试从当前 VPS 发起，不能证明中国客户端直连可用；正式使用前必须从实际客户端复测。"
+    echo "  本地筛选：TLS 1.3 + HTTP/2、当前 VPS 直连可通、握手稳定。"
+    echo "  远程筛选：从中国运营商探针验证 TLS 1.3 握手；Globalping 不保证提供 HTTP/2 协商结果。"
+    _warn "中国远程模式使用公开探针，结果用于线路筛选；正式使用前仍建议从实际客户端复测。"
     echo ""
     echo -e "    ${GREEN}[1]${NC} 美国 (US)"
     echo -e "    ${GREEN}[2]${NC} 日本 (JP)"
@@ -5495,6 +5729,12 @@ _sni_optimizer_menu() {
 
     local pool=""
     local region_name=""
+    local test_mode=""
+    local source_locations=""
+    local source_count=0
+    local source_fallback_locations=""
+    local source_selected_count=0
+    local source_label=""
     case "$region_choice" in
         1) pool="$pool_us"; region_name="美国" ;;
         2) pool="$pool_jp"; region_name="日本" ;;
@@ -5521,56 +5761,169 @@ _sni_optimizer_menu() {
     esac
 
     echo ""
-    _info "开始测试 ${region_name} 候选域名（每个 3 轮）..."
+    echo -e "    ${GREEN}[1]${NC} 仅测试当前 VPS"
+    echo -e "    ${GREEN}[2]${NC} 仅测试中国远程出发点"
+    echo -e "    ${GREEN}[3]${NC} VPS + 中国远程出发点（推荐）"
+    read -r -p "  请选择测试方式 [1-3，默认 3]: " test_mode
+    [ -z "$test_mode" ] && test_mode="3"
+    case "$test_mode" in
+        1|2|3) ;;
+        *) _warn "测试方式无效，使用 VPS + 中国远程出发点。"; test_mode="3" ;;
+    esac
+    if [ "$test_mode" = "2" ] || [ "$test_mode" = "3" ]; then
+        _sni_choose_sources || return 1
+        source_locations="$SNI_SOURCE_LOCATIONS"
+        source_fallback_locations="$SNI_SOURCE_FALLBACK_LOCATIONS"
+        source_count="$SNI_SOURCE_COUNT"
+        source_selected_count="$SNI_SOURCE_SELECTED_COUNT"
+        source_label="$SNI_SOURCE_LABEL"
+        _info "已选 ${source_selected_count} 条参考线路；实际请求 ${source_count} 个中国运营商探针。"
+    fi
+    if [ "$test_mode" != "1" ]; then
+        [ -z "$server_ip" ] && _init_server_ip >/dev/null 2>&1
+        if [[ "$server_ip" =~ ^[0-9a-fA-F:.]+$ ]] && [ -n "$server_ip" ]; then
+            _info "正在验证中国出发点到当前 VPS（${server_ip}）的 ICMP 延迟..."
+            local vps_ping_data
+            vps_ping_data=$(_sni_globalping_measure ping "$server_ip" "$source_locations" "$source_fallback_locations")
+            if [ -n "$vps_ping_data" ]; then
+                echo "  中国出发点 -> VPS ${server_ip}："
+                _sni_globalping_ping_vps "$vps_ping_data" | sed 's/^/    /'
+            else
+                _warn "远程 VPS ping 测试未返回结果，继续进行 SNI HTTPS 测试。"
+            fi
+        else
+            _warn "未能识别当前 VPS 公网 IP，跳过远程 VPS ping。"
+        fi
+    fi
 
-    # 探测 curl 是否支持强制 TLS1.3（退出码 4 = 该构建不支持此选项）
-    SNI_TLS13_FLAG="--tlsv1.3"
-    curl -so /dev/null $SNI_TLS13_FLAG --connect-timeout 3 -m 5 "https://www.apple.com/" 2>/dev/null
-    if [ $? -eq 4 ]; then
-        SNI_TLS13_FLAG=""
-        _warn "当前 curl 构建不支持强制 TLS1.3，将只测握手延迟（Linux 服务器一般不受影响）。"
+    echo ""
+    [ "$test_mode" = "1" ] && _info "开始测试 ${region_name} 候选域名（当前 VPS，每个 3 轮）..."
+    [ "$test_mode" = "2" ] && _info "开始测试 ${region_name} 候选域名（仅中国远程探针）..."
+    [ "$test_mode" = "3" ] && _info "开始测试 ${region_name} 候选域名（VPS 本地 + 中国远程探针）..."
+
+    if [ "$test_mode" != "2" ]; then
+        # 本地模式才需要检查 curl 的 TLS 1.3 支持。
+        SNI_TLS13_FLAG="--tlsv1.3"
+        curl -so /dev/null $SNI_TLS13_FLAG --connect-timeout 3 -m 5 "https://www.apple.com/" 2>/dev/null
+        if [ $? -eq 4 ]; then
+            SNI_TLS13_FLAG=""
+            _warn "当前 curl 构建不支持强制 TLS1.3，将只测握手延迟。"
+        fi
     fi
     echo ""
 
     local results=""
     local domain result avg jitter h2 ok score
-    for domain in $pool; do
-        printf '  测试 %-28s ... ' "$domain"
-        result=$(_sni_test_domain "$domain")
-        if [ -z "$result" ]; then
-            echo -e "${RED}握手失败/不支持 TLS1.3${NC}"
-            continue
+    if [ "$test_mode" != "2" ]; then
+        for domain in $pool; do
+            printf '  测试 %-28s ... ' "$domain"
+            result=$(_sni_test_domain "$domain")
+            if [ -z "$result" ]; then
+                echo -e "${RED}握手失败/不支持 TLS1.3${NC}"
+                continue
+            fi
+            IFS=$'\t' read -r avg jitter h2 ok <<< "$result"
+            echo -e "平均 ${GREEN}${avg}ms${NC} 波动 ${YELLOW}${jitter}ms${NC} HTTP/2: ${h2} (${ok}/3)"
+            # 综合评分 = 平均延迟 + 波动惩罚；无 HTTP/2 追加 300ms 惩罚（Reality 要求 H2）
+            score=$((avg + jitter))
+            [ "$h2" != "✓" ] && score=$((score + 300))
+            results="${results}${score}\t${domain}\t${avg}\t${jitter}\t${h2}\n"
+        done
+    fi
+
+    # 远程请求每个域名最多使用用户选择的五个地点，候选最多五个。
+    local remote_domains=() remote_scores=()
+    local remote_candidates="" remote_result remote_avg remote_good remote_details remote_protocols remote_requested
+    if [ "$test_mode" = "2" ] || [ "$test_mode" = "3" ]; then
+        if [ -z "$source_locations" ] || [ "$source_count" -eq 0 ]; then
+            _warn "没有可用的远程出发点，跳过 Globalping 测试。"
+        else
+            if [ -n "$results" ]; then
+                remote_candidates=$(echo -e "$results" | grep -v '^$' | sort -n | head -5 | cut -f2)
+            else
+                # 远程模式也只取前 5 个候选，避免一次菜单操作产生过多外部请求。
+                remote_candidates=$(printf '%s\n' $pool | head -5)
+            fi
+            echo ""
+            _info "开始中国远程探测（最多 5 个候选，每个候选请求 ${source_count} 个运营商探针）..."
+            local remote_results=""
+            for domain in $remote_candidates; do
+                printf '  远程测试 %-25s ... ' "$domain"
+                remote_result=$(_sni_globalping_http "$domain" "$source_locations" "$source_fallback_locations")
+                if [ -z "$remote_result" ]; then
+                    echo -e "${RED}远程探针失败/超时${NC}"
+                    continue
+                fi
+                IFS=$'\t' read -r remote_avg remote_good remote_details remote_protocols remote_requested <<< "$remote_result"
+                echo -e "TLS 平均 ${GREEN}${remote_avg}ms${NC}，成功 ${remote_good}/${remote_requested:-$source_count}，协议 ${remote_protocols}"
+                echo "    出发点: ${remote_details}"
+                [ "$remote_good" -lt "${remote_requested:-$source_count}" ] && _warn "${domain} 仅有 ${remote_good}/${remote_requested:-$source_count} 个探针完成 TLS1.3 握手；缺失探针已计入惩罚。"
+                remote_domains+=("$domain")
+                remote_scores+=("$((remote_avg + (${remote_requested:-$source_count} - remote_good) * 500))")
+                remote_results="${remote_results}${remote_scores[${#remote_scores[@]}-1]}\t${domain}\t${remote_avg}\t0\t-\t${remote_avg}\n"
+            done
+
+            if [ "$test_mode" = "2" ]; then
+                results="$remote_results"
+            elif [ -z "$results" ] && [ -n "$remote_results" ]; then
+                _warn "VPS 本地所有候选均失败；仅展示中国探针结果，不作为 Reality SNI 推荐。"
+                results="$remote_results"
+                test_mode="2"
+            elif [ -z "$remote_results" ]; then
+                _warn "中国远程探针全部失败，仅展示 VPS 本地结果。"
+                test_mode="1"
+            fi
+
+            # 远程模式下，将远程 TLS 延迟和丢失探针惩罚加到本地评分。
+            if [ "$test_mode" = "3" ] && [ -n "$results" ]; then
+                local merged_results=""
+                local matched_score j
+                while IFS=$'\t' read -r score domain avg jitter h2 ok; do
+                    [ -z "$domain" ] && continue
+                    matched_score=""
+                    for ((j=0; j<${#remote_domains[@]}; j++)); do
+                        if [ "${remote_domains[$j]}" = "$domain" ]; then
+                            matched_score="${remote_scores[$j]}"
+                            break
+                        fi
+                    done
+                    [ -n "$matched_score" ] || continue
+                    score=$((score + matched_score))
+                    merged_results="${merged_results}${score}\t${domain}\t${avg}\t${jitter}\t${h2}\t${matched_score}\n"
+                done <<< "$(echo -e "$results")"
+                results="$merged_results"
+            fi
         fi
-        IFS=$'\t' read -r avg jitter h2 ok <<< "$result"
-        echo -e "平均 ${GREEN}${avg}ms${NC} 波动 ${YELLOW}${jitter}ms${NC} HTTP/2: ${h2} (${ok}/3)"
-        # 综合评分 = 平均延迟 + 波动惩罚；无 HTTP/2 追加 300ms 惩罚（Reality 要求 H2）
-        score=$((avg + jitter))
-        [ "$h2" != "✓" ] && score=$((score + 300))
-        results="${results}${score}\t${domain}\t${avg}\t${jitter}\t${h2}\n"
-    done
+    fi
 
     if [ -z "$results" ]; then
-        _error "所有候选域名测试失败，请检查网络。"
+        _error "所有候选域名测试失败，请检查网络或远程探针状态。"
         return
     fi
 
     echo ""
-    echo -e "${YELLOW}═════════════ VPS 侧候选结果 TOP 5（最佳在最后）═════════════${NC}"
-    # 取 VPS 侧综合评分前 5，倒序展示（不代表国内客户端排名）
+    [ "$test_mode" = "1" ] && echo -e "${YELLOW}═════════════ VPS 侧候选结果 TOP 5（最佳在最后）═════════════${NC}"
+    [ "$test_mode" = "2" ] && echo -e "${YELLOW}══════ 中国远程探针结果 TOP 5（最佳在最后）══════${NC}"
+    [ "$test_mode" = "3" ] && echo -e "${YELLOW}══════ VPS + 中国远程探针综合结果 TOP 5（最佳在最后）══════${NC}"
+    # 取综合评分前 5，倒序展示。
     local top5=$(echo -e "$results" | grep -v '^$' | sort -n | head -5 | sort -rn)
     local rank=$(echo "$top5" | grep -c .)
-    while IFS=$'\t' read -r score domain avg jitter h2; do
+    while IFS=$'\t' read -r score domain avg jitter h2 remote_score_value; do
         [ -z "$domain" ] && continue
-        if [ "$rank" -eq 1 ]; then
-            echo -e "  ${GREEN}第 1 名  ${domain}${NC}  平均 ${avg}ms 波动 ${jitter}ms HTTP/2:${h2}  ${GREEN}<< 推荐${NC}"
+        if [ "$test_mode" = "2" ]; then
+            echo -e "  第 ${rank} 名  ${CYAN}${domain}${NC}  中国探针 TLS1.3: ${avg}ms"
+        elif [ "$rank" -eq 1 ]; then
+            echo -e "  ${GREEN}第 1 名  ${domain}${NC}  VPS 平均 ${avg}ms 波动 ${jitter}ms HTTP/2:${h2}  ${GREEN}<< 推荐${NC}"
         else
-            echo -e "  第 ${rank} 名  ${CYAN}${domain}${NC}  平均 ${avg}ms 波动 ${jitter}ms HTTP/2:${h2}"
+            echo -e "  第 ${rank} 名  ${CYAN}${domain}${NC}  VPS 平均 ${avg}ms 波动 ${jitter}ms HTTP/2:${h2}"
         fi
         rank=$((rank - 1))
     done <<< "$top5"
     echo -e "${YELLOW}═══════════════════════════════════════════════════════${NC}"
     echo ""
-    _info "候选域名仅在 VPS 侧通过握手校验；用于节点前，请从中国客户端实际测试该域名。"
+    [ "$test_mode" = "1" ] && _info "本次结果仅代表 VPS 侧测试；用于节点前，请从中国客户端实际复测。"
+    [ "$test_mode" != "1" ] && _info "远程结果来自 Globalping 中国运营商探针；探针城市、网络和经纬度已在测试时显示。"
+    [ "$test_mode" != "1" ] && _info "已选出发点：${source_label}"
     _info "通过验证后可用于：主菜单 [5] 修改节点 SNI，或 [18] 中转菜单 [7] 修改中转入口 SNI。"
 }
 
