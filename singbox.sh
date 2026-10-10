@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="30"
+export SCRIPT_VERSION="32"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -5580,7 +5580,7 @@ _sni_globalping_measure() {
     fi
     if [ "$measurement_type" = http ]; then
         payload=$(jq -nc --arg type "$measurement_type" --arg target "$target" --argjson locations "$locations_json" \
-            '{type:$type,target:$target,locations:$locations,measurementOptions:{protocol:"HTTP2",request:{method:"HEAD"}}}') || return 1
+            '{type:$type,target:$target,locations:$locations,measurementOptions:{protocol:"HTTP2",ipVersion:4,request:{method:"HEAD"}}}') || return 1
     else
         payload=$(jq -nc --arg type "$measurement_type" --arg target "$target" --argjson locations "$locations_json" \
             '{type:$type,target:$target,locations:$locations}') || return 1
@@ -5849,8 +5849,14 @@ _sni_test_domain() {
     _validate_sni_domain "$domain" || return 1
     local resolve_args=()
     for r in 1 2 3; do
+        local round_timeout=6
+        if [ -n "${SNI_LOCAL_DEADLINE:-}" ]; then
+            round_timeout=$((SNI_LOCAL_DEADLINE - SECONDS))
+            [ "$round_timeout" -gt 0 ] || { _warn "${domain}: 本轮本地测试时间预算已耗尽。"; return 1; }
+            [ "$round_timeout" -gt 6 ] && round_timeout=6
+        fi
         out=$(curl -q --noproxy '*' -4 -I -o /dev/null -sS --tlsv1.3 --tls-max 1.3 --http2 \
-            "${resolve_args[@]}" --connect-timeout 3 --max-time 6 \
+            "${resolve_args[@]}" --connect-timeout 3 --max-time "$round_timeout" \
             -w '%{time_appconnect} %{time_connect} %{http_version} %{http_code} %{ssl_verify_result} %{remote_ip}' \
             "https://${domain}/" 2>/dev/null)
         rc=$?
@@ -5901,7 +5907,7 @@ _sni_cdn_hint() {
     esac
 }
 
-# Accept domain names only, never URLs/CIDRs/shell fragments, at most twelve unique entries.
+# Accept domain names only, never URLs/CIDRs/shell fragments, at most 32 unique entries.
 _sni_parse_candidates() {
     local input="${1//,/ }" domain result="" count=0
     input=${input//$'\r'/ }
@@ -5912,14 +5918,104 @@ _sni_parse_candidates() {
         _validate_sni_domain "$domain" || { _warn "无效候选: ${domain}"; return 1; }
         case " $result " in *" $domain "*) continue ;; esac
         count=$((count+1))
-        [ "$count" -le 12 ] || { _warn "最多 12 个候选域名。"; return 1; }
+        [ "$count" -le 32 ] || { _warn "最多 32 个候选域名。"; return 1; }
         result="${result}${result:+ }${domain}"
     done
     [ "$count" -gt 0 ] || return 1
     printf '%s\n' "$result"
 }
 
+# Province codes verified against https://www.zstaticcdn.com/api/v1/DescribeAllNodes.
+# Keep the directory offline; resolve the selected domains on each run.
+_province_catalog() {
+    printf '%s\n' '河北|he' '山西|sx' '辽宁|ln' '吉林|jl' '黑龙江|hl' \
+        '江苏|js' '浙江|zj' '安徽|ah' '福建|fj' '江西|jx' '山东|sd' \
+        '河南|ha' '湖北|hb' '湖南|hn' '广东|gd' '海南|hi' '四川|sc' \
+        '贵州|gz' '云南|yn' '陕西|sn' '甘肃|gs' '青海|qh' '内蒙古|nm' \
+        '广西|gx' '西藏|xz' '宁夏|nx' '新疆|xj' '北京|bj' '天津|tj' \
+        '上海|sh' '重庆|cq'
+}
+
+# One small HEAD per round, no redirects, no proxy environment, no body download.
+# TCP success is independent of HTTP status and is not a throughput/loss estimate.
+_province_test_endpoint() {
+    local host="$1" out rc ip connect code r ms
+    local tcp_ok=0 http_ok=0 sum=0 min=999999 max=0 ips='' rounds=''
+    [[ "$host" =~ ^[a-z]{2}-(ct|cu|cm)-v4\.ip\.zstaticcdn\.com$ ]] || return 1
+    for r in 1 2 3; do
+        rc=0
+        out=$(LC_ALL=C curl -q --noproxy '*' -4 -I -sS -o /dev/null \
+            --connect-timeout 3 --max-time 5 \
+            -w '%{remote_ip} %{time_connect} %{http_code}' "http://${host}:80/" 2>/dev/null) || rc=$?
+        # Use a delimiter-preserving placeholder when curl reports no remote IP.
+        read -r ip connect code <<< "${out/# /- }"
+        if _sni_public_ipv4 "$ip" && [[ "$connect" =~ ^[0-9]+([.][0-9]+)?$ ]] && \
+           awk -v t="$connect" 'BEGIN {exit !(t > 0 && t <= 5)}'; then
+            ms=$(LC_ALL=C awk -v t="$connect" 'BEGIN {printf "%.0f", t*1000}')
+            tcp_ok=$((tcp_ok + 1)); sum=$((sum + ms))
+            [ "$ms" -lt "$min" ] && min=$ms
+            [ "$ms" -gt "$max" ] && max=$ms
+            case " $ips " in *" $ip "*) ;; *) ips="${ips}${ips:+ }${ip}" ;; esac
+        fi
+        if [ "$rc" -eq 0 ] && [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && _sni_public_ipv4 "$ip"; then
+            http_ok=$((http_ok + 1))
+        fi
+        rounds="${rounds}${rounds:+；}第${r}轮 HTTP=${code:-000}/curl=${rc}"
+    done
+    if [ "$tcp_ok" -gt 0 ]; then
+        printf 'TCP 成功 %s/3，建连均值 %sms，范围 %s–%sms；HTTP 响应 %s/3；实际 IPv4: %s；%s\n' \
+            "$tcp_ok" "$((sum / tcp_ok))" "$min" "$max" "$http_ok" "$ips" "$rounds"
+    else
+        printf 'TCP 成功 0/3，建连耗时不可用；HTTP 响应 %s/3；%s\n' "$http_ok" "$rounds"
+    fi
+}
+
+_province_print_report() {
+    [ -n "$SNI_PROVINCE_REPORT" ] || return 0
+    printf '\n════ VPS → %s 三网 IPv4 参考结果 ════\n%s\n' "$SNI_PROVINCE_NAME" "$SNI_PROVINCE_REPORT"
+    echo 'TCP 建连耗时包含往返路径；这里不测国内主动访问 VPS，也不验证 SNI、代理吞吐或丢包率。'
+    echo 'HTTP 3xx/4xx/5xx 表示收到响应；curl 6=解析失败，7=连接失败，28=超时。省份/运营商为目录标签。'
+}
+
+_province_test_menu() {
+    SNI_PROVINCE_REPORT='' SNI_PROVINCE_NAME=''
+    command -v curl >/dev/null 2>&1 || { _error '缺少 curl，无法测试。'; return 1; }
+    local rows=() row name code choice idx=1 selected='' carrier host result
+    echo '选择一个省级地区，自动测试电信、联通、移动 IPv4（固定 3 个目标，每个 3 轮，总等待约不超过 45 秒）。'
+    echo '来源: https://www.zstaticcdn.com/；方向: 当前 VPS → 省级三网 HTTP :80 参考节点。'
+    while IFS= read -r row; do
+        rows+=("$row")
+        IFS='|' read -r name code <<< "$row"
+        printf '  %2d) %s (%s)\n' "$idx" "$name" "$code"
+        idx=$((idx + 1))
+    done < <(_province_catalog)
+    read -r -p '输入省份编号/名称/代码（如 河北 或 he；0/回车取消）: ' choice || return 1
+    case "$choice" in ''|0) return 1 ;; esac
+    if [[ "$choice" =~ ^[0-9]{1,2}$ ]]; then
+        idx=$((10#$choice))
+        [ "$idx" -ge 1 ] && [ "$idx" -le "${#rows[@]}" ] && selected="${rows[$((idx - 1))]}"
+    else
+        for row in "${rows[@]}"; do
+            IFS='|' read -r name code <<< "$row"
+            if [ "$choice" = "$name" ] || [ "$choice" = "$code" ]; then selected="$row"; break; fi
+        done
+    fi
+    [ -n "$selected" ] || { _warn '省份无效，本轮取消；一次只选一个省。'; return 1; }
+    IFS='|' read -r name code <<< "$selected"
+    SNI_PROVINCE_NAME="$name"
+    for carrier in ct cu cm; do
+        case "$carrier" in ct) name=电信 ;; cu) name=联通 ;; cm) name=移动 ;; esac
+        host="${code}-${carrier}-v4.ip.zstaticcdn.com"
+        printf '  测试 %s %s:80（最多 15 秒）...\n' "$name" "$host"
+        result=$(_province_test_endpoint "$host") || result='未取得测试结果'
+        printf '    %s\n' "$result"
+        SNI_PROVINCE_REPORT="${SNI_PROVINCE_REPORT}${SNI_PROVINCE_REPORT:+$'\n'}${name} ${host}:80  ${result}"
+    done
+    _province_print_report
+}
+
 _sni_optimizer_menu() {
+    local SNI_PROVINCE_REPORT='' SNI_PROVINCE_NAME=''
     if ! command -v curl >/dev/null 2>&1; then
         _error "缺少 curl 依赖，无法测试。"
         return
@@ -5929,7 +6025,7 @@ _sni_optimizer_menu() {
     # Legacy seed domains are unverified discovery inputs, not preapproved Reality targets.
     local pool_us="www.amd.com www.cisco.com aws.amazon.com www.dell.com addons.mozilla.org academy.nvidia.com swdist.apple.com updates.cdn-apple.com"
     local pool_jp="www.lovelive-anime.jp www.nintendo.co.jp www.sony.jp www.canon.jp www.toyota.jp www.jal.co.jp www.sega.jp www.square-enix.co.jp"
-    local pool_sg="www.singaporeair.com www.dbs.com.sg www.sgx.com www.singtel.com www.starhub.com www.uob.com.sg www.capitaland.com www.grab.com"
+    local pool_sg="www.ntu.edu.sg www.sutd.edu.sg www.a-star.edu.sg www.np.edu.sg www.nea.gov.sg www.nus.edu.sg www.smu.edu.sg www.singaporeair.com www.dbs.com.sg www.sgx.com www.singtel.com www.starhub.com www.uob.com.sg www.capitaland.com www.grab.com"
     local pool_hk="www.cathaypacific.com www.hkex.com.hk www.hangseng.com www.pccw.com www.towngas.com www.mtr.com.hk"
     local pool_kr="www.hyundai.com www.kia.com www.lge.co.kr www.coupang.com www.krx.co.kr"
     local pool_tw="www.asus.com www.gigabyte.com www.msi.com www.acer.com www.tsmc.com"
@@ -5937,16 +6033,19 @@ _sni_optimizer_menu() {
     local pool_gb="www.arm.com www.dyson.co.uk www.tesco.com www.bt.com www.burberry.com"
     # Unverified global seeds may resolve to CDN edges; apply the same checks.
     local pool_global="swdist.apple.com updates.cdn-apple.com gateway.icloud.com itunes.apple.com aws.amazon.com www.amd.com www.cisco.com addons.mozilla.org"
+    # Content variety is a discovery aid, never proof of origin locality or TLS suitability.
+    local pool_media="blog.codinghorror.com www.joelonsoftware.com kottke.org www.thisiscolossal.com code.blender.org www.blender.org www.arte.tv www.bfi.org.uk"
 
     clear
     echo -e "${CYAN}"
     echo "  ╔═══════════════════════════════════════╗"
-    echo "  ║      SNI 优选（伪装域名测速）         ║"
+    echo "  ║      SNI 优选（脚本 v${SCRIPT_VERSION}）          ║"
     echo "  ╚═══════════════════════════════════════╝"
     echo -e "${NC}"
     echo "  本地筛选：证书验证 + TLS 1.3 + HTTP/2 + 非跳转 2xx，IPv4 同 IP 三轮测试。"
     echo "  远程筛选：中国运营商探针发起 HTTP/2 + HEAD；TLS 1.3、证书及 HTTP 状态分别校验。"
     echo "  注意：远程结果不等于真实客户端到 VPS 的代理吞吐或断流测试。"
+    echo "  TLS 耗时不含 DNS/TCP 建连；排名仅比较本轮候选，不代表全网最优。"
     _warn "中国远程模式使用公开探针，结果用于线路筛选；正式使用前仍建议从实际客户端复测。"
     _warn "适用于 VLESS-Reality/Any-Reality。普通 AnyTLS 请使用证书覆盖的自有域名；第三方 SNI 不等于可信伪装。"
     echo ""
@@ -5954,13 +6053,14 @@ _sni_optimizer_menu() {
     echo -e "    ${GREEN}[2]${NC} 日本 (JP)"
     echo -e "    ${GREEN}[3]${NC} 新加坡 (SG)"
     echo -e "    ${GREEN}[4]${NC} 自动检测当前服务器所在地区"
-    echo -e "    ${GREEN}[5]${NC} 自定义候选域名（默认，最多 12 个）"
+    echo -e "    ${GREEN}[5]${NC} 自定义候选域名（默认，最多 32 个）"
     echo -e "    ${GREEN}[6]${NC} 从本地文件读取候选域名（每行一个）"
+    echo -e "    ${GREEN}[7]${NC} 博客／图文／视频站种子（跨地区，仍需严格验证）"
     echo ""
     echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
     echo ""
     local region_choice
-    read -r -p "  请选择候选来源 [0-6，默认 5]: " region_choice || return
+    read -r -p "  请选择候选来源 [0-7，默认 5]: " region_choice || return
     region_choice=${region_choice:-5}
 
     local pool=""
@@ -6000,14 +6100,18 @@ _sni_optimizer_menu() {
             region_name="自定义候选"
             ;;
         6)
-            read -r -p "候选文件绝对路径（每行一个域名，最多 12 个，无 URL/注释）: " candidate_file || return
+            read -r -p "候选文件绝对路径（每行一个域名，最多 32 个，无 URL/注释）: " candidate_file || return
             if [ ! -f "$candidate_file" ] || [ ! -r "$candidate_file" ] ||
-               [ "$(wc -c < "$candidate_file")" -gt 4096 ]; then
-                _warn "文件不存在、不可读或大于 4KB。"; return 1
+               [ "$(wc -c < "$candidate_file")" -gt 16384 ]; then
+                _warn "文件不存在、不可读或大于 16KB。"; return 1
             fi
             candidate_input=$(<"$candidate_file")
             pool=$(_sni_parse_candidates "$candidate_input") || return 1
             region_name="文件候选"
+            ;;
+        7)
+            pool="$pool_media"; region_name="博客／图文／视频站（跨地区种子）"
+            _info '内容类型不保证低延迟或隐蔽性；只测首页 HEAD，不下载媒体，默认 CDN 排除策略仍生效。'
             ;;
         *) return ;;
     esac
@@ -6024,13 +6128,19 @@ _sni_optimizer_menu() {
     echo ""
     echo -e "    ${GREEN}[1]${NC} 仅测试当前 VPS"
     echo -e "    ${GREEN}[2]${NC} 仅测试中国远程出发点"
-    echo -e "    ${GREEN}[3]${NC} VPS + 中国远程出发点（推荐）"
-    read -r -p "  请选择测试方式 [1-3，默认 3]: " test_mode || return
-    [ -z "$test_mode" ] && test_mode="3"
+    echo -e "    ${GREEN}[3]${NC} VPS + 中国远程出发点"
+    echo -e "    ${GREEN}[4]${NC} VPS 本地 SNI + 一个省三网 IPv4 参考（默认）"
+    read -r -p "  请选择测试方式 [1-4，默认 4]: " test_mode || return
+    [ -z "$test_mode" ] && test_mode="4"
     case "$test_mode" in
-        1|2|3) ;;
-        *) _warn "测试方式无效，使用 VPS + 中国远程出发点。"; test_mode="3" ;;
+        1|2|3|4) ;;
+        *) _warn "测试方式无效，已取消。"; return 1 ;;
     esac
+    if [ "$test_mode" = 4 ]; then
+        _province_test_menu || return 1
+        test_mode=1
+        _info '省级三网结果仅作线路参考；接下来独立验证 VPS 本地 SNI，不计入 SNI 排名。'
+    fi
     local requested_test_mode="$test_mode"
     if [ "$test_mode" = 2 ]; then
         _warn "仅远程模式不执行本地证书/H2/CDN 校验；CDN 排除策略未验证，只展示线路诊断结果。"
@@ -6074,21 +6184,34 @@ _sni_optimizer_menu() {
 
     local results=""
     local candidate_count=0 local_pass_count=0 local_excluded_count=0
-    local local_failed_count=0 local_failures="" local_exclusions=""
+    local local_failed_count=0 local_failures="" local_exclusions="" local_skipped_count=0
+    local SNI_LOCAL_DEADLINE=$((SECONDS + 120))
     local domain result avg jitter h2 ok score target_ip cname target_meta cdn_status
     candidate_count=$(printf '%s\n' $pool | awk 'NF {count++} END {print count+0}')
+    echo "  本轮 ${candidate_count} 个候选；本地测试预算约 120 秒，失败即跳过，不自动扩展或循环重试。"
     if [ "$test_mode" != "2" ]; then
         for domain in $pool; do
+            if [ "$SECONDS" -ge "$SNI_LOCAL_DEADLINE" ]; then
+                local_skipped_count=$((local_skipped_count + 1))
+                local_failures="${local_failures}${domain}\t未测试：本轮时间预算耗尽（不代表域名失败）\n"
+                continue
+            fi
             printf '  测试 %-28s ... ' "$domain"
             result=$(_sni_test_domain "$domain")
             if [ -z "$result" ]; then
+                if [ "$SECONDS" -ge "$SNI_LOCAL_DEADLINE" ]; then
+                    local_skipped_count=$((local_skipped_count + 1))
+                    local_failures="${local_failures}${domain}\t未完成：本轮时间预算耗尽，不能判定失败\n"
+                    echo '时间预算耗尽，未完成校验'
+                    continue
+                fi
                 local_failed_count=$((local_failed_count + 1))
                 local_failures="${local_failures}${domain}\t未通过严格校验（具体原因见上方 [注意]）\n"
                 echo -e "${RED}未通过证书/TLS1.3/H2/HTTP/稳定性校验${NC}"
                 continue
             fi
             IFS=$'\t' read -r avg jitter h2 ok target_ip <<< "$result"
-            echo -e "平均 ${GREEN}${avg}ms${NC} 波动 ${YELLOW}${jitter}ms${NC} HTTP/2: ${h2} (${ok}/3)"
+            echo -e "TLS 平均 ${GREEN}${avg}ms${NC} 波动 ${YELLOW}${jitter}ms${NC} HTTP/2: ${h2} (${ok}/3)"
             cname=""
             if command -v dig >/dev/null 2>&1; then
                 cname=$(dig +time=2 +tries=1 +short CNAME "$domain" 2>/dev/null | head -1)
@@ -6128,9 +6251,11 @@ _sni_optimizer_menu() {
         else
             if [ -n "$results" ]; then
                 remote_candidates=$(echo -e "$results" | grep -v '^$' | sort -n | head -5 | cut -f2)
-            else
+            elif [ "$test_mode" = 2 ]; then
                 # 远程模式也只取前 5 个候选，避免一次菜单操作产生过多外部请求。
                 remote_candidates=$(printf '%s\n' $pool | head -5)
+            else
+                echo '  联合模式：本地无通过项，跳过候选远程请求；需要单独诊断请选仅远程模式。'
             fi
             local pool_domain remote_domain selected_for_remote
             for pool_domain in $pool; do
@@ -6144,7 +6269,7 @@ _sni_optimizer_menu() {
                 fi
             done
             echo ""
-            _info "开始中国远程探测（最多 5 个候选；精确城市 ${source_count} 个，运营商回退 ${source_carrier_count} 个）..."
+            [ -n "$remote_candidates" ] && _info "开始中国远程探测（最多 5 个候选；精确城市 ${source_count} 个，运营商回退 ${source_carrier_count} 个）..."
             local remote_results=""
             for domain in $remote_candidates; do
                 remote_attempted_count=$((remote_attempted_count + 1))
@@ -6212,6 +6337,7 @@ _sni_optimizer_menu() {
     fi
 
     if [ -z "$results" ]; then
+        _province_print_report
         echo ""
         echo -e "${YELLOW}════════════ 本轮 SNI 筛选结论 ════════════${NC}"
         echo -e "  ${RED}结论：本轮没有可直接应用的 SNI 候选。${NC}"
@@ -6220,11 +6346,11 @@ _sni_optimizer_menu() {
             [ "$local_excluded_count" -gt 0 ] && printf '，%s 个因 CDN/WAF 策略排除' "$local_excluded_count"
             echo ""
         fi
-        if [ "$remote_attempted_count" -gt 0 ]; then
+        if [ "$requested_test_mode" != 1 ]; then
             printf '  中国远程探测: %s/%s 个候选已尝试，%s 个完整覆盖，%s 个部分覆盖，%s 个无有效结果\n' \
                 "$remote_attempted_count" "$candidate_count" "$remote_complete_count" "$remote_diagnostic_count" "$remote_failed_count"
             if [ "$remote_skipped_count" -gt 0 ]; then
-                printf '  未进入远程阶段: %s 个（每轮最多 5 个；优先测试 VPS 本地通过项，本地全失败时取前 5 个）\n' \
+                printf '  未进入远程阶段: %s 个（联合模式仅验证本地通过项；每轮最多 5 个）\n' \
                     "$remote_skipped_count"
                 printf '    %s\n' "$(printf '%b' "$remote_skipped" | paste -sd ' ' -)"
             fi
@@ -6254,7 +6380,7 @@ _sni_optimizer_menu() {
         fi
         if [ -n "$local_failures" ]; then
             echo ""
-            echo -e "${YELLOW}════ VPS 本地未通过候选 ════${NC}"
+            echo -e "${YELLOW}════ VPS 本地未通过／未完成候选 ════${NC}"
             while IFS=$'\t' read -r domain result; do
                 [ -n "$domain" ] || continue
                 printf '  %-28s %s\n' "$domain" "$result"
@@ -6268,7 +6394,10 @@ _sni_optimizer_menu() {
                 printf '  %-28s %s\n' "$domain" "$result"
             done <<< "$(echo -e "$local_exclusions")"
         fi
-        if [ "$requested_test_mode" != "1" ] && [ "$remote_diagnostic_count" -eq 0 ] && \
+        printf '  因本地时间预算未测试或未完成: %s 个。\n' "$local_skipped_count"
+        if [ "$requested_test_mode" = 3 ] && [ "$local_pass_count" -eq 0 ]; then
+            echo '  请补充候选后重测；本地淘汰项未重复发起远程请求。'
+        elif [ "$requested_test_mode" != "1" ] && [ "$remote_diagnostic_count" -eq 0 ] && \
            [ "$remote_complete_count" -eq 0 ] && [ "$remote_failed_count" -eq 0 ]; then
             _warn "没有取得可评分的远程结果；请检查出发点、Globalping 状态或稍后重试。"
         elif [ "$requested_test_mode" = "1" ]; then
@@ -6278,25 +6407,33 @@ _sni_optimizer_menu() {
         return
     fi
 
+    _province_print_report
     echo ""
-    [ "$test_mode" = "1" ] && echo -e "${YELLOW}═════════════ VPS 侧候选结果 TOP 5（最佳在最后）═════════════${NC}"
+    [ "$test_mode" = "1" ] && echo -e "${YELLOW}═════════════ VPS 侧候选结果 TOP 5（本轮评分较低者在最后）═════════════${NC}"
     [ "$test_mode" = "2" ] && echo -e "${YELLOW}════ 中国远程复测候选 TOP 5（不代表 VPS 本地通过）════${NC}"
-    [ "$test_mode" = "3" ] && echo -e "${YELLOW}══════ VPS + 中国远程探针综合结果 TOP 5（最佳在最后）══════${NC}"
+    [ "$test_mode" = "3" ] && echo -e "${YELLOW}══════ VPS + 中国远程探针综合结果 TOP 5（本轮评分较低者在最后）══════${NC}"
     # 取综合评分前 5，倒序展示。
     local top5=$(echo -e "$results" | grep -v '^$' | sort -n | head -5 | sort -rn)
     local rank=$(echo "$top5" | grep -c .)
+    if [ "$rank" -eq 1 ]; then
+        echo '  仅 1 个候选进入本轮排名，缺少可比样本，不能认定为最优；建议补充候选。'
+    fi
     while IFS=$'\t' read -r score domain avg jitter h2 remote_score_value; do
         [ -z "$domain" ] && continue
         if [ "$test_mode" = "2" ]; then
             echo -e "  第 ${rank} 名  ${CYAN}${domain}${NC}  中国探针 TLS1.3: ${avg}ms"
+        elif [ "$avg" -ge 300 ]; then
+            echo "  第 ${rank} 名  ${domain}  VPS TLS ${avg}ms 波动 ${jitter}ms HTTP/2:${h2}  高延迟，暂不建议优先使用"
         elif [ "$rank" -eq 1 ]; then
-            echo -e "  ${GREEN}第 1 名  ${domain}${NC}  VPS TLS ${avg}ms 波动 ${jitter}ms HTTP/2:${h2}  ${GREEN}<< 优先复测候选${NC}"
+            echo -e "  ${GREEN}第 1 名  ${domain}${NC}  VPS TLS ${avg}ms 波动 ${jitter}ms HTTP/2:${h2}  本轮复测候选"
         else
             echo -e "  第 ${rank} 名  ${CYAN}${domain}${NC}  VPS 平均 ${avg}ms 波动 ${jitter}ms HTTP/2:${h2}"
         fi
         rank=$((rank - 1))
     done <<< "$top5"
     echo -e "${YELLOW}═══════════════════════════════════════════════════════${NC}"
+    echo '  本地 TLS ≥300ms 标注为高延迟（经验提示，非协议硬性标准）；波动为三轮最大值减最小值。'
+    printf '  因本地时间预算未测试或未完成: %s 个。\n' "$local_skipped_count"
     if [ -n "$remote_diagnostics" ]; then
         echo ""
         echo -e "${YELLOW}════ 其余远程诊断候选（仅供复测）════${NC}"
@@ -6318,7 +6455,7 @@ _sni_optimizer_menu() {
     fi
     if [ "$remote_skipped_count" -gt 0 ]; then
         echo ""
-        printf '[信息] 未进入远程阶段（每轮最多 5 个）: %s\n' \
+        printf '[信息] 未进入远程阶段（联合模式仅验证本地通过项；每轮最多 5 个）: %s\n' \
             "$(printf '%b' "$remote_skipped" | paste -sd ' ' -)"
     fi
     echo ""
@@ -6334,7 +6471,7 @@ _sni_optimizer_menu() {
             "$local_pass_count" "$candidate_count" "$local_failed_count" "$local_excluded_count"
     fi
     if [ -n "$local_failures" ]; then
-        echo -e "${YELLOW}════ VPS 本地未通过候选 ════${NC}"
+        echo -e "${YELLOW}════ VPS 本地未通过／未完成候选 ════${NC}"
         while IFS=$'\t' read -r domain result; do
             [ -n "$domain" ] || continue
             printf '  %-28s %s\n' "$domain" "$result"
@@ -6915,13 +7052,14 @@ _main_menu() {
         echo -e "    ${GREEN}[18]${NC} 落地/中转/第三方节点导入"
         echo -e "    ${GREEN}[19]${NC} Xray 节点管理"
         echo -e "    ${GREEN}[20]${NC} SNI 优选（伪装域名测速）"
+        echo -e "    ${GREEN}[21]${NC} 省级三网 IPv4 线路参考"
         echo ""
 
         echo -e "  ─────────────────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
 
-        read -p "  请输入选项 [0-20]: " choice
+        read -p "  请输入选项 [0-21]: " choice
 
         case $choice in
             1) _require_singbox && _show_add_node_menu ;;
@@ -6944,6 +7082,7 @@ _main_menu() {
             18) _require_singbox && _advanced_features ;;
             19) _xray_features ;;
             20) _sni_optimizer_menu ;;
+            21) _province_test_menu ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
