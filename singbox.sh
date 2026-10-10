@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="27"
+export SCRIPT_VERSION="28"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -465,15 +465,18 @@ _snapshot_node_state() {
 }
 
 _restore_node_state() {
-    local dir="$1" file base
+    local dir="$1" file base rc=0
     for file in "$CONFIG_FILE" "$CLASH_YAML_FILE" "$METADATA_FILE" "$ARGO_METADATA_FILE"; do
         base=$(basename "$file")
         if [ -f "$dir/$base.missing" ]; then
-            rm -f "$file"
+            rm -f "$file" || rc=1
         elif [ -f "$dir/$base" ]; then
-            cp -p "$dir/$base" "$file"
+            cp -p "$dir/$base" "$file" || rc=1
+        else
+            rc=1
         fi
     done
+    return "$rc"
 }
 
 # 统一服务管理
@@ -5238,10 +5241,43 @@ _modify_node_menu() {
 
 # 校验 SNI 域名格式（含至少一个点的合法主机名）
 _validate_sni_domain() {
-    [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]
+    [ "${#1}" -le 253 ] || return 1
+    [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] || return 1
+    [[ "$1" =~ ^[0-9.]+$ ]] && return 1
+    local label
+    local labels="${1//./ }"
+    for label in $labels; do [ "${#label}" -le 63 ] || return 1; done
+    return 0
+}
+
+# Only regenerate verified self-signed files dedicated to this script-created node.
+_sni_cert_regenerable() {
+    local tag="$1" cert="$2" key="$3" subject issuer file
+    case "$tag" in */*|*..*) return 1 ;; esac
+    [ "$cert" = "${SINGBOX_DIR}/${tag}.pem" ] && [ "$key" = "${SINGBOX_DIR}/${tag}.key" ] || return 1
+    [ -f "$cert" ] && [ -f "$key" ] && [ ! -L "$cert" ] && [ ! -L "$key" ] || return 1
+    subject=$(openssl x509 -in "$cert" -noout -subject -nameopt RFC2253 2>/dev/null) || return 1
+    issuer=$(openssl x509 -in "$cert" -noout -issuer -nameopt RFC2253 2>/dev/null) || return 1
+    [ "${subject#subject=}" = "${issuer#issuer=}" ] || return 1
+    openssl verify -no_check_time -check_ss_sig -CAfile "$cert" "$cert" >/dev/null 2>&1 || return 1
+    for file in "$CONFIG_FILE" "${SINGBOX_DIR}/relay.json"; do
+        [ -f "$file" ] || continue
+        # A shared certificate/key cannot be replaced without updating its other users.
+        jq empty "$file" >/dev/null 2>&1 || return 1
+        jq -e --arg t "$tag" --arg c "$cert" --arg k "$key" --arg f "$file" --arg main "$CONFIG_FILE" '
+            [.inbounds[]? | select(.tls.certificate_path == $c or .tls.key_path == $k) |
+            select($f != $main or (.tag != $t and (.tag|startswith($t + "-hop-")|not)))] | length == 0
+            ' "$file" >/dev/null 2>&1 || return 1
+    done
+    return 0
 }
 
 _modify_sni() {
+    # Scope signal handlers and exported jq values to this transaction.
+    (
+    trap - EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     if ! jq -e '.inbounds | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
         _warning "当前没有任何节点。"
         return
@@ -5280,8 +5316,12 @@ _modify_sni() {
         return
     fi
 
-    read -p "请输入要修改 SNI 的节点编号 (输入 0 返回): " num
-    [[ ! "$num" =~ ^[0-9]+$ ]] || [ "$num" -eq 0 ] && return
+    local num new_sni regen_choice
+    read -r -p "请输入要修改 SNI 的节点编号 (输入 0 返回): " num || return
+    [[ "$num" =~ ^[0-9]+$ ]] || return
+    [ "${#num}" -le 6 ] || { _error "编号超出范围。"; return 1; }
+    num=$((10#$num))
+    [ "$num" -eq 0 ] && return
 
     local count=${#inbound_tags[@]}
     if [ "$num" -gt "$count" ]; then
@@ -5293,6 +5333,8 @@ _modify_sni() {
     local tag_to_modify=${inbound_tags[$index]}
     local type_to_modify=${inbound_types[$index]}
     local port_to_modify=${inbound_ports[$index]}
+    local sni_socket_proto=tcp
+    case "$type_to_modify" in hysteria2|tuic) sni_socket_proto=udp ;; esac
     local old_sni=${inbound_snis[$index]}
     local display_name_to_modify=${display_names[$index]}
 
@@ -5307,45 +5349,77 @@ _modify_sni() {
         _info "Reality 节点：新 SNI 必须是支持 TLS 1.3 + HTTP/2 且直连可访问的真实域名（可用主菜单 [20] SNI 优选测试）。"
     fi
 
-    read -p "请输入新的 SNI 域名: " new_sni
-    new_sni=$(echo "$new_sni" | xargs)
+    read -r -p "请输入新的 SNI 域名: " new_sni || return
+    new_sni=$(printf '%s' "$new_sni" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     if [ -z "$new_sni" ]; then _warning "输入为空，已取消。"; return; fi
     if ! _validate_sni_domain "$new_sni"; then _error "SNI 域名格式无效！"; return; fi
     if [ "$new_sni" == "$old_sni" ]; then _warning "新 SNI 与当前相同，无需修改。"; return; fi
 
     # 自签证书节点询问是否重新生成证书（在写配置前确认，便于失败时整体回滚）
     local regen_cert="false"
-    if [ "$is_reality" != "true" ] && [ -n "$cert_path" ] && [ -f "$cert_path" ] && [[ "$cert_path" == ${SINGBOX_DIR}/* ]]; then
-        read -p "检测到自签名证书，是否同时为新 SNI 重新生成证书? (Y/n): " regen_choice
+    if [ "$is_reality" != "true" ] && _sni_cert_regenerable "$tag_to_modify" "$cert_path" "$key_path"; then
+        read -r -p "检测到自签名证书，是否同时为新 SNI 重新生成证书? (Y/n): " regen_choice || return
         if [[ "$regen_choice" != "n" && "$regen_choice" != "N" ]]; then
             regen_cert="true"
         fi
     fi
-
-    _info "正在修改 SNI: ${old_sni} -> ${new_sni}"
-
-    # 备份配置与证书，任一步失败可整体回滚
-    local backup_file="${CONFIG_FILE}.bak_sni_$$"
-    cp "$CONFIG_FILE" "$backup_file"
-    if [ "$regen_cert" == "true" ]; then
-        cp "$cert_path" "${cert_path}.bak_sni" 2>/dev/null
-        cp "$key_path" "${key_path}.bak_sni" 2>/dev/null
+    if [ "$is_reality" != true ] && [ "$regen_cert" != true ]; then
+        _warn "证书未重签：新 SNI 必须已被现有证书覆盖或符合客户端固定指纹策略；否则客户端可能拒绝连接。"
     fi
 
-    _rollback_sni_change() {
-        mv "$backup_file" "$CONFIG_FILE" 2>/dev/null
-        if [ "$regen_cert" == "true" ]; then
-            [ -f "${cert_path}.bak_sni" ] && mv "${cert_path}.bak_sni" "$cert_path"
-            [ -f "${key_path}.bak_sni" ] && mv "${key_path}.bak_sni" "$key_path"
+    _info "正在修改 SNI: ${old_sni} -> ${new_sni}"
+    export SNI_TAG_VALUE="$tag_to_modify"
+    export SNI_NEW_VALUE="$new_sni"
+
+    # 备份配置与证书，任一步失败可整体回滚
+    local sni_state_dir
+    sni_state_dir=$(mktemp -d /tmp/singbox-sni-state.XXXXXX) || return 1
+    if ! _snapshot_node_state "$sni_state_dir"; then
+        _error "无法完整备份配置，取消 SNI 修改。"
+        rm -rf "$sni_state_dir"
+        return 1
+    fi
+    if [ "$regen_cert" == "true" ]; then
+        if ! cp -p "$cert_path" "$sni_state_dir/certificate.pem" ||
+           ! cp -p "$key_path" "$sni_state_dir/key.pem"; then
+            _error "无法备份证书与私钥，取消 SNI 修改。"
+            rm -rf "$sni_state_dir"
+            return 1
         fi
+    fi
+
+    local sni_pending=false sni_restarted=false
+    _rollback_sni_change() {
+        sni_pending=false
+        local rollback_rc=0
+        _restore_node_state "$sni_state_dir" || rollback_rc=1
+        if [ "$regen_cert" == "true" ]; then
+            cp -p "$sni_state_dir/certificate.pem" "$cert_path" || rollback_rc=1
+            cp -p "$sni_state_dir/key.pem" "$key_path" || rollback_rc=1
+        fi
+        if [ "$rollback_rc" -eq 0 ]; then
+            _info "已恢复 SNI 修改前的文件。"
+        else
+            _error "部分文件恢复失败，请使用保留快照人工恢复，勿继续修改节点。"
+        fi
+        _info "SNI 修改前的恢复快照保留在: ${sni_state_dir}（包含敏感配置，请勿公开）。"
+        return "$rollback_rc"
     }
+    trap 'if [ "$sni_pending" = true ]; then
+        if _rollback_sni_change && [ "$sni_restarted" = true ]; then
+            if ! _manage_service restart >/dev/null 2>&1 || ! _verify_service_ready "$port_to_modify" "$sni_socket_proto"; then
+                _error "中断恢复后旧服务仍未就绪，请检查日志及保留快照。"
+            fi
+        fi
+    fi' EXIT
+    sni_pending=true
 
     # 1. config.json: 主节点及 HY2 跳跃子节点统一更新 server_name；Reality 同步 handshake.server
-    if ! _atomic_modify_json "$CONFIG_FILE" ".inbounds |= map(if ((.tag == \"$tag_to_modify\") or (.tag | startswith(\"${tag_to_modify}-hop-\"))) and ((.tls.server_name // null) != null) then .tls.server_name = \"$new_sni\" else . end)"; then
+    if ! _atomic_modify_json "$CONFIG_FILE" '.inbounds |= map(if ((.tag == env.SNI_TAG_VALUE) or (.tag | startswith(env.SNI_TAG_VALUE + "-hop-"))) and ((.tls.server_name // null) != null) then .tls.server_name = env.SNI_NEW_VALUE else . end)'; then
         _error "更新配置失败！"; _rollback_sni_change; return 1
     fi
     if [ "$is_reality" == "true" ]; then
-        if ! _atomic_modify_json "$CONFIG_FILE" ".inbounds |= map(if (.tag == \"$tag_to_modify\") and ((.tls.reality // null) != null) then .tls.reality.handshake.server = \"$new_sni\" else . end)"; then
+        if ! _atomic_modify_json "$CONFIG_FILE" '.inbounds |= map(if (.tag == env.SNI_TAG_VALUE) and ((.tls.reality // null) != null) then .tls.reality.handshake.server = env.SNI_NEW_VALUE else . end)'; then
             _error "更新 Reality 握手域名失败！"; _rollback_sni_change; return 1
         fi
     fi
@@ -5354,7 +5428,7 @@ _modify_sni() {
     local old_fp=""
     local new_fp=""
     if [ "$regen_cert" == "true" ]; then
-        old_fp=$(_cert_sha256_hex "${cert_path}.bak_sni")
+        old_fp=$(_cert_sha256_hex "$sni_state_dir/certificate.pem")
         if _generate_self_signed_cert "$new_sni" "$cert_path" "$key_path"; then
             new_fp=$(_cert_sha256_hex "$cert_path")
         else
@@ -5364,7 +5438,7 @@ _modify_sni() {
 
     # 3. sing-box 校验，失败回滚
     if ! _validate_merged_config >/dev/null 2>&1; then
-        _error "新配置未通过合并配置校验，已回滚。"
+        _error "新配置未通过合并配置校验，正在恢复旧文件。"
         _rollback_sni_change
         return 1
     fi
@@ -5374,34 +5448,46 @@ _modify_sni() {
     if [ -n "$proxy_name" ] && [ -f "$CLASH_YAML_FILE" ]; then
         export SNI_PROXY_NAME="$proxy_name"
         export NEW_SNI_VAL="$new_sni"
-        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(SNI_PROXY_NAME)) | select(has("servername")) | .servername) = env(NEW_SNI_VAL)'
-        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(SNI_PROXY_NAME)) | select(has("sni")) | .sni) = env(NEW_SNI_VAL)'
+        if ! _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(SNI_PROXY_NAME)) | select(has("servername")) | .servername) = env(NEW_SNI_VAL)' ||
+           ! _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(SNI_PROXY_NAME)) | select(has("sni")) | .sni) = env(NEW_SNI_VAL)'; then
+            _error "客户端 YAML 同步失败，正在恢复旧文件。"; _rollback_sni_change; return 1
+        fi
         _info "Clash 配置 SNI 已同步: ${proxy_name}"
     fi
 
     # 5. metadata.json: server_name 字段与分享链接 sni/pcs/pinSHA256 参数
-    if [ -f "$METADATA_FILE" ] && jq -e ".\"$tag_to_modify\"" "$METADATA_FILE" >/dev/null 2>&1; then
-        _atomic_modify_json "$METADATA_FILE" "if (.\"$tag_to_modify\" | has(\"server_name\")) then .\"$tag_to_modify\".server_name = \"$new_sni\" else . end"
-        local current_link=$(jq -r ".\"$tag_to_modify\".share_link // \"\"" "$METADATA_FILE")
+    if [ -f "$METADATA_FILE" ] && jq -e --arg t "$tag_to_modify" '.[$t]' "$METADATA_FILE" >/dev/null 2>&1; then
+        if ! _atomic_modify_json "$METADATA_FILE" 'if (.[env.SNI_TAG_VALUE] | has("server_name")) then .[env.SNI_TAG_VALUE].server_name = env.SNI_NEW_VALUE else . end'; then
+            _error "SNI 元数据同步失败，正在恢复旧文件。"; _rollback_sni_change; return 1
+        fi
+        local current_link=$(jq -r --arg t "$tag_to_modify" '.[$t].share_link // ""' "$METADATA_FILE")
         if [ -n "$current_link" ]; then
             local new_link=$(echo "$current_link" | sed -E "s/([?&]sni=)[^&#]*/\1${new_sni}/g; s/([?&]peer=)[^&#]*/\1${new_sni}/g")
             if [ -n "$new_fp" ]; then
                 new_link=$(echo "$new_link" | sed -E "s/([?&](pcs|pinSHA256)=)[0-9a-fA-F]+/\1${new_fp}/g")
             fi
-            _atomic_modify_json "$METADATA_FILE" ".\"$tag_to_modify\".share_link = \"$new_link\""
+            export SNI_LINK_VALUE="$new_link"
+            if ! _atomic_modify_json "$METADATA_FILE" '.[env.SNI_TAG_VALUE].share_link = env.SNI_LINK_VALUE'; then
+                _error "分享链接同步失败，正在恢复旧文件。"; _rollback_sni_change; return 1
+            fi
         fi
     fi
 
-    if ! _manage_service "restart"; then
-        _error "SNI 已修改但服务重启失败，正在恢复旧配置。"
-        _rollback_sni_change
-        _manage_service "restart" >/dev/null 2>&1 || true
+    sni_restarted=true
+    if ! _manage_service "restart" || ! _verify_service_ready "$port_to_modify" "$sni_socket_proto"; then
+        _error "SNI 已修改但服务重启或端口就绪检查失败，正在恢复旧配置。"
+        if _rollback_sni_change; then
+            if ! _manage_service "restart" >/dev/null 2>&1 || ! _verify_service_ready "$port_to_modify" "$sni_socket_proto"; then
+                _error "旧配置恢复后服务仍未就绪，请检查服务日志。"
+            fi
+        fi
         return 1
     fi
-    rm -f "$backup_file" "${cert_path}.bak_sni" "${key_path}.bak_sni" 2>/dev/null
+    sni_pending=false
+    rm -rf "$sni_state_dir"
     _success "SNI 修改成功，服务已重新加载: ${old_sni} -> ${new_sni}"
 
-    local updated_link=$(jq -r ".\"$tag_to_modify\".share_link // \"\"" "$METADATA_FILE" 2>/dev/null)
+    local updated_link=$(jq -r --arg t "$tag_to_modify" '.[$t].share_link // ""' "$METADATA_FILE" 2>/dev/null)
     if [ -n "$updated_link" ]; then
         echo ""
         echo -e "更新后的分享链接:"
@@ -5410,6 +5496,7 @@ _modify_sni() {
     if [ -n "$new_fp" ]; then
         _info "自签证书已按新 SNI 重新生成，客户端如固定了证书指纹（pcs/pinSHA256）请使用新链接。"
     fi
+    )
 }
 
 # ============================================================
@@ -5483,11 +5570,17 @@ _sni_globalping_city() {
 _sni_globalping_measure() {
     local measurement_type="$1" target="$2" locations_json="$3" fallback_json="${4:-}"
     local payload response measurement_id data state i http_code response_file
+    printf '%s' "$locations_json" | jq -e 'type == "array" and length > 0 and length <= 5 and
+        all(.[]; .country == "CN" and .limit == 1)' >/dev/null 2>&1 || return 1
+    if [ -n "$fallback_json" ]; then
+        printf '%s' "$fallback_json" | jq -e 'type == "array" and length > 0 and length <= 5 and
+            all(.[]; .country == "CN" and .limit == 1)' >/dev/null 2>&1 || return 1
+    fi
     payload=$(jq -nc --arg type "$measurement_type" --arg target "$target" --argjson locations "$locations_json" \
         '{type:$type,target:$target,locations:$locations}') || return 1
     response_file=$(mktemp /tmp/sni-globalping.XXXXXX) || return 1
-    http_code=$(curl -sS --connect-timeout 8 --max-time 15 -X POST \
-        -H 'content-type: application/json' -H 'user-agent: singbox-lite-sni/27' \
+    http_code=$(curl -q -sS --connect-timeout 8 --max-time 15 -X POST \
+        -H 'content-type: application/json' -H "user-agent: singbox-lite-sni/${SCRIPT_VERSION}" \
         --data "$payload" -o "$response_file" -w '%{http_code}' \
         'https://api.globalping.io/v1/measurements' 2>/dev/null)
     if [ "$http_code" = 422 ] && [ -n "$fallback_json" ] && \
@@ -5495,8 +5588,8 @@ _sni_globalping_measure() {
         _warn "所选城市缺少可用探针，回退到同运营商的中国探针；实际城市以结果为准。"
         payload=$(jq -nc --arg type "$measurement_type" --arg target "$target" --argjson locations "$fallback_json" \
             '{type:$type,target:$target,locations:$locations}') || { rm -f "$response_file"; return 1; }
-        http_code=$(curl -sS --connect-timeout 8 --max-time 15 -X POST \
-            -H 'content-type: application/json' -H 'user-agent: singbox-lite-sni/27' \
+        http_code=$(curl -q -sS --connect-timeout 8 --max-time 15 -X POST \
+            -H 'content-type: application/json' -H "user-agent: singbox-lite-sni/${SCRIPT_VERSION}" \
             --data "$payload" -o "$response_file" -w '%{http_code}' \
             'https://api.globalping.io/v1/measurements' 2>/dev/null)
     fi
@@ -5508,8 +5601,8 @@ _sni_globalping_measure() {
     response=$(<"$response_file")
     rm -f "$response_file"
     response=$(printf '%s' "$response" | tr -d '\000-\010\013\014\016-\037')
-    measurement_id=$(echo "$response" | jq -r '.id // empty')
-    [ -n "$measurement_id" ] || return 1
+    measurement_id=$(printf '%s' "$response" | jq -r '.id // empty')
+    [[ "$measurement_id" =~ ^[A-Za-z0-9_-]+$ ]] && [ "${#measurement_id}" -le 128 ] || return 1
 
     data=""
     state=""
@@ -5517,7 +5610,7 @@ _sni_globalping_measure() {
     local deadline=$((SECONDS + 30))
     while [ "$SECONDS" -lt "$deadline" ]; do
         sleep 1
-        data=$(curl -fsS --connect-timeout 5 --max-time 6 \
+        data=$(curl -q -fsS --connect-timeout 5 --max-time 6 \
             "https://api.globalping.io/v1/measurements/${measurement_id}" 2>/dev/null) || continue
         data=$(printf '%s' "$data" | tr -d '\000-\010\013\014\016-\037')
         state=$(printf '%s' "$data" | jq -r '.status // empty' 2>/dev/null) || continue
@@ -5529,28 +5622,52 @@ _sni_globalping_measure() {
 
 # 输出: 平均 TLS 毫秒<TAB>成功探针数<TAB>探针详情
 _sni_globalping_http() {
-    local data avg good details protocols requested
+    local data avg good details protocols requested http_good coverage
     data=$(_sni_globalping_measure http "$1" "$2" "$3") || return 1
-    avg=$(echo "$data" | jq -r '
-        [.results[]? | select(.result.tls.protocol == "TLSv1.3") | .result.timings.tls // empty] |
+    # Reject malformed/incomplete API data before shell arithmetic or TSV parsing.
+    printf '%s' "$data" | jq -e '
+        type == "object" and .status == "finished" and (.results|type == "array") and
+        (.probesCount|type == "number" and . >= 1 and . <= 5 and . == floor) and
+        .probesCount == (.results|length) and all(.results[];
+            (.probe|type == "object") and (.result|type == "object") and
+            (.probe.city == null or (.probe.city|type == "string")) and
+            (.probe.network == null or (.probe.network|type == "string")) and
+            (.result.timings.tls == null or
+                (.result.timings.tls|type == "number" and . >= 0 and . <= 60000)) and
+            (.result.statusCode == null or
+                (.result.statusCode|type == "number" and . >= 100 and . <= 599 and . == floor)))
+        ' >/dev/null 2>&1 || { _warn "Globalping HTTP 响应字段异常或探针结果不完整，跳过评分。"; return 1; }
+    avg=$(printf '%s' "$data" | jq -r '
+        [.results[]? | select(.probe.country == "CN" and .result.tls.protocol == "TLSv1.3" and .result.tls.authorized == true) | .result.timings.tls // empty] |
         if length > 0 then (add / length | floor | tostring) else empty end')
-    good=$(echo "$data" | jq -r '[.results[]? | select(.result.tls.protocol == "TLSv1.3") | .result.timings.tls // empty] | length')
-    [ -n "$avg" ] && [ "$good" -gt 0 ] 2>/dev/null || return 1
-    protocols=$(echo "$data" | jq -r '[.results[]? | select(.result.timings.tls != null) |
+    good=$(printf '%s' "$data" | jq -r '[.results[]? | select(.probe.country == "CN" and .result.tls.protocol == "TLSv1.3" and .result.tls.authorized == true) | .result.timings.tls // empty] | length')
+    [ -n "$avg" ] && [ "$good" -gt 0 ] 2>/dev/null || {
+        _warn "${1}: 无中国探针完成证书有效的 TLS1.3 测试；HTTP 成功也不代表符合 Reality 标准。"; return 1;
+    }
+    protocols=$(printf '%s' "$data" | jq -r '[.results[]? | select(.result.timings.tls != null) |
         (.result.tls.protocol // "unknown")] | unique | join(",")')
-    requested=$(echo "$data" | jq -r '.probesCount // 0')
-    details=$(echo "$data" | jq -r '[.results[]? |
-        select(.result.timings.tls != null and .result.tls.protocol == "TLSv1.3") |
-        ((.probe.city // "?") + "/" + (.probe.network // "?") + " @ " +
+    requested=$(printf '%s' "$data" | jq -r '.probesCount // 0')
+    details=$(printf '%s' "$data" | jq -r '[.results[]? |
+        ((.probe.city // "?") + "/" + (.probe.network // "?") + " AS" + ((.probe.asn // 0)|tostring) + " @ " +
          ((.probe.longitude // 0)|tostring) + "," + ((.probe.latitude // 0)|tostring))] |
-        join("; ")')
-    # 第四列保留 TLS 协议版本；Globalping 当前不保证返回 HTTP/2 协商结果。
-    printf '%s\t%s\t%s\t%s\t%s\n' "$avg" "$good" "$details" "$protocols" "$requested"
+        join("; ") | gsub("[\u0000-\u001f\u007f]"; " ")')
+    http_good=$(printf '%s' "$data" | jq -r '[.results[]? |
+        select(.probe.country == "CN" and .result.tls.protocol == "TLSv1.3" and
+        .result.tls.authorized == true and .result.status == "finished" and
+        .result.statusCode >= 200 and .result.statusCode < 300)] | length')
+    coverage=$(printf '%s' "$data" | jq -r --argjson locations "$2" '
+        .results as $r | [$locations[] | . as $loc |
+            any($r[]?; .probe.country == "CN" and .probe.asn == $loc.asn and
+                ($loc.city == null or (((.probe.city // "")|ascii_downcase) == ($loc.city|ascii_downcase))) and
+                .result.tls.protocol == "TLSv1.3" and .result.tls.authorized == true and
+                .result.status == "finished" and .result.statusCode >= 200 and .result.statusCode < 300)] |
+        if length > 0 and all(. == true) then "complete" else "partial" end') || return 1
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$avg" "$good" "$details" "$protocols" "$requested" "$http_good" "$coverage"
 }
 
 _sni_globalping_ping_vps() {
     local data="$1"
-    echo "$data" | jq -r '.results[]? |
+    printf '%s' "$data" | jq -r '.results[]? |
         (.probe.city // "?") + "/" + (.probe.network // "?") +
         " ASN" + ((.probe.asn // 0)|tostring) +
         " (" + ((.probe.longitude // 0)|tostring) + "," +
@@ -5564,7 +5681,7 @@ _sni_globalping_ping_vps() {
 }
 
 _sni_choose_sources() {
-    local rows=() choice idx selected=() source_locations='[]' fallback_locations='[]'
+    local rows=() choices=() choice idx selected=() source_locations='[]' fallback_locations='[]'
     local carrier city ip lon lat asn ping_state row selected_idx
     SNI_SOURCE_LOCATIONS=''
     SNI_SOURCE_COUNT=0
@@ -5578,6 +5695,7 @@ _sni_choose_sources() {
     echo ""
     echo -e "${CYAN}国内出发点选择（最多 5 个）${NC}"
     echo "DNS IP 仅作线路参考和本机 ping 检查；实际 HTTPS 测试使用 Globalping 的中国运营商探针。"
+    _warn "目录来自用户参考数据，IP 归属与坐标未逐一核实；目录 ASN 是运营商探针筛选条件，不是 IP 归属证明。"
     local n=1
     for row in "${rows[@]}"; do
         IFS='|' read -r carrier city ip lon lat asn <<< "$row"
@@ -5585,19 +5703,19 @@ _sni_choose_sources() {
         n=$((n + 1))
     done
     echo ""
-    read -r -p "输入编号（逗号分隔，最多 5 个；直接回车使用三网各 1 个推荐点）: " choice
+    read -r -p "输入编号（逗号分隔，最多 5 个；直接回车使用三网各 1 个参考点）: " choice || return 1
     if [ -z "$choice" ]; then
         choice="2,15,26"
     fi
     choice=${choice//,/ }
-    local requested_count=0
-    for idx in $choice; do
-        requested_count=$((requested_count + 1))
-    done
+    read -r -a choices <<< "$choice"
+    local requested_count=${#choices[@]}
     [ "$requested_count" -gt 5 ] && _warn "单次最多选择 5 个出发点，仅处理前 5 个有效编号。"
 
-    for idx in $choice; do
+    for idx in "${choices[@]}"; do
         [[ "$idx" =~ ^[0-9]+$ ]] || continue
+        [ "${#idx}" -le 3 ] || continue
+        idx=$((10#$idx))
         [ "$idx" -ge 1 ] && [ "$idx" -le "${#rows[@]}" ] || continue
         local duplicate=false
         for selected_idx in "${selected[@]}"; do
@@ -5621,7 +5739,7 @@ _sni_choose_sources() {
     for idx in "${selected[@]}"; do
         IFS='|' read -r carrier city ip lon lat asn <<< "${rows[$((idx - 1))]}"
         ping_state="未测试"
-        if command -v ping >/dev/null 2>&1 && ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
+        if command -v ping >/dev/null 2>&1 && ping -c 1 -W 1 -w 2 "$ip" >/dev/null 2>&1; then
             ping_state="可达"
         elif command -v ping >/dev/null 2>&1; then
             ping_state="不可达/禁 ICMP"
@@ -5654,40 +5772,99 @@ _sni_choose_sources() {
     SNI_SOURCE_LABEL="$labels"
 }
 
-# 对单个域名做 3 轮 TLS 握手测试（读取全局 SNI_TLS13_FLAG 决定是否强制 TLS1.3）
-# 输出: avg_ms<TAB>jitter_ms<TAB>h2(✓/✗)<TAB>ok_rounds，有效轮次不足时无输出
+# Do not degrade to unverified TLS/HTTP1 results on minimal curl builds.
+_sni_curl_capable() {
+    curl -V 2>/dev/null | grep -Eq '(^|[[:space:]])HTTP2([[:space:]]|$)' || return 1
+    curl --help all 2>/dev/null | grep -q -- '--tlsv1.3' || return 1
+    curl --help all 2>/dev/null | grep -q -- '--tls-max'
+}
+
+_sni_public_ipv4() {
+    printf '%s\n' "$1" | awk -F. '
+        NF != 4 {exit 1}
+        {for(i=1;i<=4;i++) if($i !~ /^[0-9]+$/ || length($i)>3 || $i+0>255) exit 1}
+        $1==0 || $1==10 || $1==127 || $1>=224 || ($1==169 && $2==254) ||
+        ($1==172 && $2>=16 && $2<=31) || ($1==192 && $2==168) ||
+        ($1==100 && $2>=64 && $2<=127) || ($1==198 && ($2==18 || $2==19)) ||
+        ($1==192 && $2==0 && ($3==0 || $3==2)) ||
+        ($1==198 && $2==51 && $3==100) || ($1==203 && $2==0 && $3==113) {exit 1}'
+}
+
+# Three HEAD requests avoid downloads, proxy environment variables and redirects.
+# Pin rounds 2/3 to the first validated IPv4; do not persist this IP into production config.
+# Output: avg_ms, jitter_ms, h2, rounds, IP (tab separated).
 _sni_test_domain() {
     local domain="$1"
-    local times=""
-    local h2="✗"
-    local ok=0
-    local r out t_ms hv
-
+    local times="" ok=0 ip="" r out rc app connect hv code verify observed t_ms
+    _validate_sni_domain "$domain" || return 1
+    local resolve_args=()
     for r in 1 2 3; do
-        # -r 0-0 只取 1 字节，避免下载完整页面；退出码不作硬性要求：
-        # 部分 CDN 会拒绝 Range/HEAD 请求，但 TLS 握手耗时已经测得
-        out=$(curl -o /dev/null -s $SNI_TLS13_FLAG -r 0-0 --connect-timeout 3 -m 6 \
-            -w '%{time_appconnect} %{time_namelookup} %{http_version}' \
+        out=$(curl -q --noproxy '*' -4 -I -o /dev/null -sS --tlsv1.3 --tls-max 1.3 --http2 \
+            "${resolve_args[@]}" --connect-timeout 3 --max-time 6 \
+            -w '%{time_appconnect} %{time_connect} %{http_version} %{http_code} %{ssl_verify_result} %{remote_ip}' \
             "https://${domain}/" 2>/dev/null)
-        if [ -n "$out" ]; then
-            # TLS 握手耗时 = appconnect - namelookup，排除 DNS 解析波动；握手失败时为 0
-            t_ms=$(echo "$out" | awk '{printf "%.0f", ($1-$2)*1000}')
-            hv=$(echo "$out" | awk '{print $3}')
-            if [ -n "$t_ms" ] && [ "$t_ms" -gt 0 ] 2>/dev/null; then
-                times="${times}${t_ms} "
-                ok=$((ok+1))
-                [ "$hv" == "2" ] && h2="✓"
-            fi
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            case "$rc" in
+                4) _warn "${domain}: 当前 curl TLS 后端不支持请求的功能（exit 4）。" ;;
+                6) _warn "${domain}: DNS 解析失败。" ;;
+                28) _warn "${domain}: 连接/TLS/HTTP 超时。" ;;
+                60) _warn "${domain}: 证书验证失败。" ;;
+                *) _warn "${domain}: curl 失败（exit ${rc}）。" ;;
+            esac
+            return 1
         fi
+        read -r app connect hv code verify observed <<< "$out"
+        [ "$hv" = 2 ] && [ "$verify" = 0 ] || return 1
+        # Exclude redirects and WAF/error pages; HEAD-unsupported sites need manual validation.
+        [[ "$code" =~ ^2[0-9][0-9]$ ]] || return 1
+        _sni_public_ipv4 "$observed" || return 1
+        [ -z "$ip" ] && { ip="$observed"; resolve_args=(--resolve "${domain}:443:${ip}"); }
+        [ "$observed" = "$ip" ] || return 1
+        t_ms=$(printf '%s %s\n' "$app" "$connect" | awk '$1>0 && $1>=$2 {printf "%.0f", ($1-$2)*1000}')
+        [[ "$t_ms" =~ ^[0-9]+$ ]] || return 1
+        times="${times}${t_ms} "
+        ok=$((ok+1))
     done
-
-    [ "$ok" -lt 2 ] && return 1
-
-    echo "$times" | awk -v h2="$h2" -v ok="$ok" '{
+    [ "$ok" -eq 3 ] || return 1
+    printf '%s\n' "$times" | awk -v ip="$ip" '{
         min=99999; max=0; sum=0; n=0
         for (i=1; i<=NF; i++) { sum+=$i; n++; if ($i<min) min=$i; if ($i>max) max=$i }
-        if (n>0) printf "%.0f\t%.0f\t%s\t%s\n", sum/n, max-min, h2, ok
+        if (n>0) printf "%.0f\t%.0f\t✓\t3\t%s\n", sum/n, max-min, ip
     }'
+}
+
+_sni_ip_metadata() {
+    _sni_public_ipv4 "$1" || return 1
+    curl -q --noproxy '*' -fsS --connect-timeout 2 --max-time 4 "https://ipwho.is/$1" 2>/dev/null |
+        jq -ce --arg ip "$1" 'select(.success == true and .ip == $ip) |
+            {country:.country_code,city:.city,asn:.connection.asn,org:.connection.org}'
+}
+
+# CDN detection is evidence, not proof of an origin server or its physical location.
+_sni_cdn_hint() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        *cloudflare*|*incapdns*|*incapsula*|*imperva*|*fastly*|*akamai*|*cloudfront*|*edgesuite*|*edgekey*|*azureedge*|*cdn*) printf 'detected' ;;
+        *) printf 'unknown' ;;
+    esac
+}
+
+# Accept domain names only, never URLs/CIDRs/shell fragments, at most twelve unique entries.
+_sni_parse_candidates() {
+    local input="${1//,/ }" domain result="" count=0
+    input=${input//$'\r'/ }
+    local domains=()
+    read -r -a domains <<< "${input//$'\n'/ }"
+    for domain in "${domains[@]}"; do
+        domain=$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')
+        _validate_sni_domain "$domain" || { _warn "无效候选: ${domain}"; return 1; }
+        case " $result " in *" $domain "*) continue ;; esac
+        count=$((count+1))
+        [ "$count" -le 12 ] || { _warn "最多 12 个候选域名。"; return 1; }
+        result="${result}${result:+ }${domain}"
+    done
+    [ "$count" -gt 0 ] || return 1
+    printf '%s\n' "$result"
 }
 
 _sni_optimizer_menu() {
@@ -5695,8 +5872,9 @@ _sni_optimizer_menu() {
         _error "缺少 curl 依赖，无法测试。"
         return
     fi
+    command -v jq >/dev/null 2>&1 || { _error "缺少 jq 依赖。"; return 1; }
 
-    # 各地区候选池：均为 TLS1.3 + H2、直连可通、非跳转的知名企业域名
+    # Legacy seed domains are unverified discovery inputs, not preapproved Reality targets.
     local pool_us="www.amd.com www.cisco.com aws.amazon.com www.dell.com addons.mozilla.org academy.nvidia.com swdist.apple.com updates.cdn-apple.com"
     local pool_jp="www.lovelive-anime.jp www.nintendo.co.jp www.sony.jp www.canon.jp www.toyota.jp www.jal.co.jp www.sega.jp www.square-enix.co.jp"
     local pool_sg="www.singaporeair.com www.dbs.com.sg www.sgx.com www.singtel.com www.starhub.com www.uob.com.sg www.capitaland.com www.grab.com"
@@ -5705,7 +5883,7 @@ _sni_optimizer_menu() {
     local pool_tw="www.asus.com www.gigabyte.com www.msi.com www.acer.com www.tsmc.com"
     local pool_de="www.sap.com www.siemens.com www.bosch.com www.zalando.de www.mediamarkt.de"
     local pool_gb="www.arm.com www.dyson.co.uk www.tesco.com www.bt.com www.burberry.com"
-    # 全球池：CDN Anycast 域名，就近接入，适合未收录地区
+    # Unverified global seeds may resolve to CDN edges; apply the same checks.
     local pool_global="swdist.apple.com updates.cdn-apple.com gateway.icloud.com itunes.apple.com aws.amazon.com www.amd.com www.cisco.com addons.mozilla.org"
 
     clear
@@ -5714,18 +5892,23 @@ _sni_optimizer_menu() {
     echo "  ║      SNI 优选（伪装域名测速）         ║"
     echo "  ╚═══════════════════════════════════════╝"
     echo -e "${NC}"
-    echo "  本地筛选：TLS 1.3 + HTTP/2、当前 VPS 直连可通、握手稳定。"
+    echo "  本地筛选：证书验证 + TLS 1.3 + HTTP/2 + 非跳转 2xx，IPv4 同 IP 三轮测试。"
     echo "  远程筛选：从中国运营商探针验证 TLS 1.3 握手；Globalping 不保证提供 HTTP/2 协商结果。"
     _warn "中国远程模式使用公开探针，结果用于线路筛选；正式使用前仍建议从实际客户端复测。"
+    _warn "适用于 VLESS-Reality/Any-Reality。普通 AnyTLS 请使用证书覆盖的自有域名；第三方 SNI 不等于可信伪装。"
     echo ""
     echo -e "    ${GREEN}[1]${NC} 美国 (US)"
     echo -e "    ${GREEN}[2]${NC} 日本 (JP)"
     echo -e "    ${GREEN}[3]${NC} 新加坡 (SG)"
     echo -e "    ${GREEN}[4]${NC} 自动检测当前服务器所在地区"
+    echo -e "    ${GREEN}[5]${NC} 自定义候选域名（默认，最多 12 个）"
+    echo -e "    ${GREEN}[6]${NC} 从本地文件读取候选域名（每行一个）"
     echo ""
     echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
     echo ""
-    read -p "  请选择目标区域 [0-4]: " region_choice
+    local region_choice
+    read -r -p "  请选择候选来源 [0-6，默认 5]: " region_choice || return
+    region_choice=${region_choice:-5}
 
     local pool=""
     local region_name=""
@@ -5735,14 +5918,14 @@ _sni_optimizer_menu() {
     local source_fallback_locations=""
     local source_selected_count=0
     local source_label=""
+    local candidate_input candidate_file
     case "$region_choice" in
         1) pool="$pool_us"; region_name="美国" ;;
         2) pool="$pool_jp"; region_name="日本" ;;
         3) pool="$pool_sg"; region_name="新加坡" ;;
         4)
             _info "正在检测服务器所在地区..."
-            local country=$(curl -s -m 5 https://ipinfo.io/country 2>/dev/null | tr -d ' \n\r')
-            [ -z "$country" ] && country=$(curl -s -m 5 "http://ip-api.com/line/?fields=countryCode" 2>/dev/null | tr -d ' \n\r')
+            local country=$(curl -q -s -m 5 https://ipinfo.io/country 2>/dev/null | tr -d ' \n\r')
             case "$country" in
                 US) pool="$pool_us"; region_name="美国 (US)" ;;
                 JP) pool="$pool_jp"; region_name="日本 (JP)" ;;
@@ -5757,19 +5940,46 @@ _sni_optimizer_menu() {
             esac
             _info "检测结果: ${region_name}"
             ;;
+        5)
+            read -r -p "候选域名（空格/逗号分隔；空输入取消）: " candidate_input || return
+            pool=$(_sni_parse_candidates "$candidate_input") || return 1
+            region_name="自定义候选"
+            ;;
+        6)
+            read -r -p "候选文件绝对路径（每行一个域名，最多 12 个，无 URL/注释）: " candidate_file || return
+            if [ ! -f "$candidate_file" ] || [ ! -r "$candidate_file" ] ||
+               [ "$(wc -c < "$candidate_file")" -gt 4096 ]; then
+                _warn "文件不存在、不可读或大于 4KB。"; return 1
+            fi
+            candidate_input=$(<"$candidate_file")
+            pool=$(_sni_parse_candidates "$candidate_input") || return 1
+            region_name="文件候选"
+            ;;
         *) return ;;
     esac
+
+    local exclude_cdn
+    read -r -p "排除检测到的 CDN/WAF 候选？[Y/n，默认 Y]: " exclude_cdn || return
+    exclude_cdn=${exclude_cdn:-Y}
+    _info "未检测出 CDN 不代表一定是源站；同地域/同 ASN 是参考，不保证隐蔽或不会被封。"
+    [ -z "$server_ip" ] && _init_server_ip >/dev/null 2>&1
+    local vps_meta=""
+    if _sni_public_ipv4 "$server_ip"; then vps_meta=$(_sni_ip_metadata "$server_ip"); fi
+    [ -n "$vps_meta" ] && _info "VPS IP 数据库信息（可能不准）: ${vps_meta}"
 
     echo ""
     echo -e "    ${GREEN}[1]${NC} 仅测试当前 VPS"
     echo -e "    ${GREEN}[2]${NC} 仅测试中国远程出发点"
     echo -e "    ${GREEN}[3]${NC} VPS + 中国远程出发点（推荐）"
-    read -r -p "  请选择测试方式 [1-3，默认 3]: " test_mode
+    read -r -p "  请选择测试方式 [1-3，默认 3]: " test_mode || return
     [ -z "$test_mode" ] && test_mode="3"
     case "$test_mode" in
         1|2|3) ;;
         *) _warn "测试方式无效，使用 VPS + 中国远程出发点。"; test_mode="3" ;;
     esac
+    if [ "$test_mode" = 2 ]; then
+        _warn "仅远程模式不执行本地证书/H2/CDN 校验；CDN 排除策略未验证，只展示线路诊断结果。"
+    fi
     if [ "$test_mode" = "2" ] || [ "$test_mode" = "3" ]; then
         _sni_choose_sources || return 1
         source_locations="$SNI_SOURCE_LOCATIONS"
@@ -5781,7 +5991,7 @@ _sni_optimizer_menu() {
     fi
     if [ "$test_mode" != "1" ]; then
         [ -z "$server_ip" ] && _init_server_ip >/dev/null 2>&1
-        if [[ "$server_ip" =~ ^[0-9a-fA-F:.]+$ ]] && [ -n "$server_ip" ]; then
+        if _sni_public_ipv4 "$server_ip"; then
             _info "正在验证中国出发点到当前 VPS（${server_ip}）的 ICMP 延迟..."
             local vps_ping_data
             vps_ping_data=$(_sni_globalping_measure ping "$server_ip" "$source_locations" "$source_fallback_locations")
@@ -5792,7 +6002,7 @@ _sni_optimizer_menu() {
                 _warn "远程 VPS ping 测试未返回结果，继续进行 SNI HTTPS 测试。"
             fi
         else
-            _warn "未能识别当前 VPS 公网 IP，跳过远程 VPS ping。"
+            _warn "未能识别当前 VPS 公网 IPv4，跳过远程 VPS ping（不向探针提交本机/私网地址）。"
         fi
     fi
 
@@ -5802,38 +6012,47 @@ _sni_optimizer_menu() {
     [ "$test_mode" = "3" ] && _info "开始测试 ${region_name} 候选域名（VPS 本地 + 中国远程探针）..."
 
     if [ "$test_mode" != "2" ]; then
-        # 本地模式才需要检查 curl 的 TLS 1.3 支持。
-        SNI_TLS13_FLAG="--tlsv1.3"
-        curl -so /dev/null $SNI_TLS13_FLAG --connect-timeout 3 -m 5 "https://www.apple.com/" 2>/dev/null
-        if [ $? -eq 4 ]; then
-            SNI_TLS13_FLAG=""
-            _warn "当前 curl 构建不支持强制 TLS1.3，将只测握手延迟。"
-        fi
+        _sni_curl_capable || { _error "当前 curl 缺少 HTTP/2 或 TLS1.3 参数支持，不能可靠验证 Reality；请升级 curl 或选择仅远程测试。"; return 1; }
     fi
     echo ""
 
     local results=""
-    local domain result avg jitter h2 ok score
+    local domain result avg jitter h2 ok score target_ip cname target_meta cdn_status
     if [ "$test_mode" != "2" ]; then
         for domain in $pool; do
             printf '  测试 %-28s ... ' "$domain"
             result=$(_sni_test_domain "$domain")
             if [ -z "$result" ]; then
-                echo -e "${RED}握手失败/不支持 TLS1.3${NC}"
+                echo -e "${RED}未通过证书/TLS1.3/H2/HTTP/稳定性校验${NC}"
                 continue
             fi
-            IFS=$'\t' read -r avg jitter h2 ok <<< "$result"
+            IFS=$'\t' read -r avg jitter h2 ok target_ip <<< "$result"
             echo -e "平均 ${GREEN}${avg}ms${NC} 波动 ${YELLOW}${jitter}ms${NC} HTTP/2: ${h2} (${ok}/3)"
-            # 综合评分 = 平均延迟 + 波动惩罚；无 HTTP/2 追加 300ms 惩罚（Reality 要求 H2）
+            cname=""
+            if command -v dig >/dev/null 2>&1; then
+                cname=$(dig +time=2 +tries=1 +short CNAME "$domain" 2>/dev/null | head -1)
+            fi
+            target_meta=$(_sni_ip_metadata "$target_ip")
+            cdn_status=$(_sni_cdn_hint "$cname $target_meta")
+            printf '    IP: %s  CNAME: %s  CDN/WAF: %s\n' "$target_ip" "${cname:-未知/无}" "$cdn_status"
+            printf '    IP 数据库信息（不是实测位置）: %s\n' "${target_meta:-不可用}"
+            if [ -n "$vps_meta" ] && [ -n "$target_meta" ]; then
+                printf '    与 VPS 对比: %s\n' "$(jq -nr --argjson v "$vps_meta" --argjson t "$target_meta" '
+                    "同国家=" + (($v.country == $t.country)|tostring) +
+                    " 同ASN=" + (($v.asn != null and $v.asn == $t.asn)|tostring)')"
+            fi
+            if [ "$cdn_status" = detected ] && [[ "$exclude_cdn" != n && "$exclude_cdn" != N ]]; then
+                _warn "${domain} 检测到 CDN/WAF，按本次策略排除。"; continue
+            fi
+            # Locality is displayed as evidence, not guessed from a domain TLD.
             score=$((avg + jitter))
-            [ "$h2" != "✓" ] && score=$((score + 300))
             results="${results}${score}\t${domain}\t${avg}\t${jitter}\t${h2}\n"
         done
     fi
 
     # 远程请求每个域名最多使用用户选择的五个地点，候选最多五个。
     local remote_domains=() remote_scores=()
-    local remote_candidates="" remote_result remote_avg remote_good remote_details remote_protocols remote_requested
+    local remote_candidates="" remote_result remote_avg remote_good remote_details remote_protocols remote_requested remote_http_good remote_coverage
     if [ "$test_mode" = "2" ] || [ "$test_mode" = "3" ]; then
         if [ -z "$source_locations" ] || [ "$source_count" -eq 0 ]; then
             _warn "没有可用的远程出发点，跳过 Globalping 测试。"
@@ -5854,12 +6073,15 @@ _sni_optimizer_menu() {
                     echo -e "${RED}远程探针失败/超时${NC}"
                     continue
                 fi
-                IFS=$'\t' read -r remote_avg remote_good remote_details remote_protocols remote_requested <<< "$remote_result"
-                echo -e "TLS 平均 ${GREEN}${remote_avg}ms${NC}，成功 ${remote_good}/${remote_requested:-$source_count}，协议 ${remote_protocols}"
+                IFS=$'\t' read -r remote_avg remote_good remote_details remote_protocols remote_requested remote_http_good remote_coverage <<< "$remote_result"
+                echo -e "TLS 平均 ${GREEN}${remote_avg}ms${NC}，TLS 成功 ${remote_good}/${remote_requested:-$source_count}，HTTP 2xx ${remote_http_good}/${remote_requested:-$source_count}，协议 ${remote_protocols}"
                 echo "    出发点: ${remote_details}"
-                [ "$remote_good" -lt "${remote_requested:-$source_count}" ] && _warn "${domain} 仅有 ${remote_good}/${remote_requested:-$source_count} 个探针完成 TLS1.3 握手；缺失探针已计入惩罚。"
+                if [ "$remote_coverage" != complete ] || [ "$remote_requested" -lt "$source_count" ] || [ "$remote_good" -lt "$source_count" ] || [ "$remote_http_good" -lt "$source_count" ]; then
+                    _warn "${domain} 计划 ${source_count} 个出发点，实际 ${remote_requested} 个探针、HTTP 成功 ${remote_http_good}；覆盖不足，仅作诊断，不进入联合排名。"
+                    [ "$test_mode" = 3 ] && continue
+                fi
                 remote_domains+=("$domain")
-                remote_scores+=("$((remote_avg + (${remote_requested:-$source_count} - remote_good) * 500))")
+                remote_scores+=("$((remote_avg + (source_count - remote_http_good) * 500))")
                 remote_results="${remote_results}${remote_scores[${#remote_scores[@]}-1]}\t${domain}\t${remote_avg}\t0\t-\t${remote_avg}\n"
             done
 
@@ -5870,7 +6092,7 @@ _sni_optimizer_menu() {
                 results="$remote_results"
                 test_mode="2"
             elif [ -z "$remote_results" ]; then
-                _warn "中国远程探针全部失败，仅展示 VPS 本地结果。"
+                _warn "中国远程探针无完整覆盖结果，仅展示 VPS 本地结果，不代表联合测试通过。"
                 test_mode="1"
             fi
 
@@ -5913,7 +6135,7 @@ _sni_optimizer_menu() {
         if [ "$test_mode" = "2" ]; then
             echo -e "  第 ${rank} 名  ${CYAN}${domain}${NC}  中国探针 TLS1.3: ${avg}ms"
         elif [ "$rank" -eq 1 ]; then
-            echo -e "  ${GREEN}第 1 名  ${domain}${NC}  VPS 平均 ${avg}ms 波动 ${jitter}ms HTTP/2:${h2}  ${GREEN}<< 推荐${NC}"
+            echo -e "  ${GREEN}第 1 名  ${domain}${NC}  VPS TLS ${avg}ms 波动 ${jitter}ms HTTP/2:${h2}  ${GREEN}<< 优先复测候选${NC}"
         else
             echo -e "  第 ${rank} 名  ${CYAN}${domain}${NC}  VPS 平均 ${avg}ms 波动 ${jitter}ms HTTP/2:${h2}"
         fi
@@ -5924,6 +6146,7 @@ _sni_optimizer_menu() {
     [ "$test_mode" = "1" ] && _info "本次结果仅代表 VPS 侧测试；用于节点前，请从中国客户端实际复测。"
     [ "$test_mode" != "1" ] && _info "远程结果来自 Globalping 中国运营商探针；探针城市、网络和经纬度已在测试时显示。"
     [ "$test_mode" != "1" ] && _info "已选出发点：${source_label}"
+    _warn "这不是端到端代理吞吐/断流测试，也不是不会被封或不会被回落滥用的保证。"
     _info "通过验证后可用于：主菜单 [5] 修改节点 SNI，或 [18] 中转菜单 [7] 修改中转入口 SNI。"
 }
 

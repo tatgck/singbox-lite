@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is **singbox-lite**, a comprehensive sing-box + Xray dual-core management script suite for Linux servers. It provides automated node creation, relay/transit configurations, third-party node import, port forwarding, Argo tunnels, and Clash/Mihomo configuration export.
 
-**Current script versions**: `singbox.sh v27`, `advanced_relay.sh`, `parser.sh`, `xray_manager.sh`
+**Current script versions**: `singbox.sh v28`, `advanced_relay.sh`, `parser.sh`, `xray_manager.sh`
 
-Note: The README.md describes this fork's v27 main script with additional fixes applied.
+Note: The README.md describes this fork's v28 main script with additional fixes applied.
 
 ## Repository Structure
 
@@ -113,9 +113,9 @@ sing-box 1.14 removed legacy DNS server formats (`address` field) and the `{"out
 
 ### 4. SNI Modification + SNI Optimizer (v23)
 Three new features:
-- **Main menu [5]** is now a submenu: 1) modify port (existing `_modify_port`), 2) modify SNI (new `_modify_sni` in `singbox.sh`). SNI edit lists TLS/Reality nodes by number, updates `tls.server_name` (+ `tls.reality.handshake.server` for Reality, + hop children), optionally regenerates self-signed certs for the new domain, syncs clash.yaml (`servername`/`sni` fields, only if present), metadata `server_name` and share-link `sni=`/`peer=`/`pcs=`/`pinSHA256=` params. Validates with `sing-box check`, full rollback on failure.
+- **Main menu [5]** is now a submenu: 1) modify port (existing `_modify_port`), 2) modify SNI (`_modify_sni` in `singbox.sh`). SNI edit lists TLS/Reality nodes by number, updates `tls.server_name` (+ `tls.reality.handshake.server` for Reality, + hop children), optionally regenerates only verified dedicated self-signed certs, syncs clash.yaml (`servername`/`sni` fields, only if present), metadata `server_name` and share-link `sni=`/`peer=`/`pcs=`/`pinSHA256=` params. v28 scopes changes in a subshell transaction, validates with `sing-box check`, confirms service and protocol-specific port readiness, and attempts complete rollback on failure or INT/TERM. CA/shared certificates are preserved; SIGKILL cannot be caught.
 - **Relay menu [7] 修改中转入口 SNI** (`_modify_relay_sni` in `advanced_relay.sh`): same pattern for relay entrances (vless-reality/hysteria2/tuic/anytls); regenerates entrance certs (`RELAY_AUX_DIR/<tag>.pem`) with the simple `openssl req -subj /CN=` style used at creation; validates merged config (`check -c config.json -c relay.json`). Relay menu renumbered: clear-all 7→8, port-forwarding 8→9.
-- **Main menu [20] SNI 优选** (`_sni_optimizer_menu`): region pools (US/JP/SG + auto-detect via ipinfo.io→ip-api.com, plus HK/KR/TW/DE/GB pools and a global anycast-CDN fallback), 3 rounds of TLS handshake latency per domain via curl (`time_appconnect - time_namelookup`, exit code deliberately ignored since some CDNs reject Range/HEAD after a successful handshake), score = avg + jitter + 300ms penalty if no HTTP/2, top-5 shown reversed (best last). Probes curl for `--tlsv1.3` support once (exit 4 = unsupported build) and degrades gracefully.
+- **Main menu [20] SNI 优选** (`_sni_optimizer_menu`, v28): defaults to custom domains (max 12) or a local candidate file; legacy regional pools are unverified seeds. Requires three same-IPv4 HEAD responses with verified certificates, TLS1.3, H2 and nonredirecting 2xx; failures/unsupported curl do not degrade into recommendations. Displays CNAME and optional IP database metadata with evidence-based CDN filtering (default exclude detected CDN). Remote results distinguish TLS and HTTP success and validate selected CN city/ASN coverage. Run `bash scripts/test-sni.sh`; see `SNI-GUIDE.md` for diagnostic and fallback-abuse boundaries.
 
 ### 5. Node Creation and Update Verification (v24)
 - Node creation no longer reports success at config-write time. The main menu snapshots `config.json`, `clash.yaml`, and metadata, then requires merged-config validation, service restart, and every newly added primary port to be listening before reporting success; failures restore the snapshot.
@@ -173,7 +173,7 @@ git push origin main
 
 ## Notes for Future Sessions
 
-- README.md describes the current v27 main script with fixes
+- README.md describes the current v28 main script with fixes
 - Parser supports strict protocol-specific parsing (no auto-detection fallback)
 - All scripts share a state lock mechanism at `/var/lock/singbox_relay.lock`
 - Atomic writes use temp files + `mv` for JSON/YAML updates
