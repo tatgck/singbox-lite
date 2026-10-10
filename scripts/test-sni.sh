@@ -7,7 +7,7 @@ load_function() {
     declare -F "$1" >/dev/null
 }
 for name in _validate_sni_domain _sni_cert_regenerable _sni_public_ipv4 _sni_test_domain _sni_parse_candidates \
-    _sni_cdn_hint _sni_globalping_http _sni_source_catalog _sni_globalping_city _sni_choose_sources \
+    _sni_cdn_hint _sni_globalping_measure _sni_globalping_http _sni_source_catalog _sni_globalping_city _sni_choose_sources \
     _snapshot_node_state _restore_node_state _modify_sni _sni_optimizer_menu; do load_function "$name"; done
 _warn() { :; }; _warning() { :; }; _info() { :; }; _error() { :; }; _success() { :; }
 CYAN='' NC='' YELLOW='' GREEN=''
@@ -44,7 +44,8 @@ for mock_output in '0 0.010 2 200 0 45.60.35.24' '0.030 0.010 1.1 200 0 45.60.35
     reject _sni_test_domain www.example.com
 done
 
-_sni_globalping_measure() { printf '%s\n' "$fixture"; }
+fixture_measure() { printf '%s\n' "$fixture"; }
+_sni_globalping_measure() { fixture_measure; }
 fixture='{"status":"finished","probesCount":1,"results":[{"probe":{"country":"CN","city":"Beijing","asn":4134,"network":"Test\\nCarrier"},"result":{"status":"finished","statusCode":200,"timings":{"tls":20},"tls":{"authorized":true,"protocol":"TLSv1.3"}}}]}'
 locations='[{"country":"CN","asn":4134,"city":"Beijing","limit":1}]'
 result=$(_sni_globalping_http www.example.com "$locations" '')
@@ -64,6 +65,71 @@ fixture=$(printf '%s' "$fixture" | jq '.results[0].probe.country="CN" | .probesC
 reject _sni_globalping_http www.example.com "$locations" ''
 fixture=$(printf '%s' "$fixture" | jq '.probesCount=1 | .results[0].result.timings.tls=-1')
 reject _sni_globalping_http www.example.com "$locations" ''
+
+# Verify a successful but partial exact-city response triggers a bounded ASN fallback.
+measure_tmp=$(command mktemp -d /tmp/sni-measure.XXXXXX)
+load_function _sni_globalping_measure
+curl() {
+    local output_file="" payload="" arg
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -o) output_file="$2"; shift ;;
+            --data) payload="$2"; shift ;;
+            https://api.globalping.io/v1/measurements/exact)
+                if [ "${mock_exact_full:-false}" = true ]; then
+                    printf '%s\n' '{"status":"finished","probesCount":2,"results":[{"probe":{"country":"CN","city":"Beijing","asn":4134,"network":"Telecom"},"result":{"status":"finished","statusCode":403,"timings":{"tls":20},"tls":{"authorized":true,"protocol":"TLSv1.3"}}},{"probe":{"country":"CN","city":"Shanghai","asn":9808,"network":"Mobile"},"result":{"status":"finished","statusCode":200,"timings":{"tls":20},"tls":{"authorized":true,"protocol":"TLSv1.3"}}}]}'
+                else
+                    printf '%s\n' '{"status":"finished","probesCount":1,"results":[{"probe":{"country":"CN","city":"Shanghai","asn":9808,"network":"Mobile"},"result":{"status":"finished","statusCode":200,"timings":{"tls":20},"tls":{"authorized":true,"protocol":"TLSv1.3"}}}]}'
+                fi
+                return ;;
+            https://api.globalping.io/v1/measurements/fallback)
+                printf '%s\n' '{"status":"finished","probesCount":2,"results":[{"probe":{"country":"CN","city":"Guangzhou","asn":4134,"network":"Telecom"},"result":{"status":"finished","statusCode":200,"timings":{"tls":22},"tls":{"authorized":true,"protocol":"TLSv1.3"}}},{"probe":{"country":"CN","city":"Shanghai","asn":9808,"network":"Mobile"},"result":{"status":"finished","statusCode":200,"timings":{"tls":20},"tls":{"authorized":true,"protocol":"TLSv1.3"}}}]}'
+                return ;;
+        esac
+        shift
+    done
+    if [ -n "$output_file" ]; then
+        printf '%s\n' "$payload" >> "$measure_tmp/payloads"
+        if printf '%s' "$payload" | jq -e 'any(.locations[]; .city != null)' >/dev/null; then
+            if [ "${mock_no_probes:-false}" = true ]; then
+                printf '%s\n' '{"error":{"type":"no_probes_found"}}' > "$output_file"
+                printf '422'
+                return
+            fi
+            printf '%s\n' '{"id":"exact"}' > "$output_file"
+        else
+            printf '%s\n' '{"id":"fallback"}' > "$output_file"
+        fi
+        printf '202'
+    fi
+}
+exact_locations='[{"country":"CN","asn":4134,"city":"Beijing","limit":1},{"country":"CN","asn":9808,"city":"Shanghai","limit":1}]'
+fallback_locations='[{"country":"CN","asn":4134,"limit":1},{"country":"CN","asn":9808,"limit":1}]'
+measure_result=$(_sni_globalping_measure http www.example.com "$exact_locations" "$fallback_locations")
+check test "$(printf '%s' "$measure_result" | jq -r '._singboxFallback')" = true
+check test "$(printf '%s' "$measure_result" | jq -r '.results | length')" = 2
+check test "$(wc -l < "$measure_tmp/payloads" | tr -d ' ')" = 2
+check jq -se 'all(.[]; .measurementOptions.protocol == "HTTP2" and .measurementOptions.request.method == "HEAD")' "$measure_tmp/payloads"
+result=$(_sni_globalping_http www.example.com "$exact_locations" "$fallback_locations")
+check test "$(printf '%s' "$result" | cut -f7)" = complete-fallback
+mock_exact_full=true
+measure_result=$(_sni_globalping_measure http www.example.com "$exact_locations" "$fallback_locations")
+check test "$(printf '%s' "$measure_result" | jq -r '._singboxFallback')" = true
+check test "$(wc -l < "$measure_tmp/payloads" | tr -d ' ')" = 6
+mock_exact_full=false
+mock_no_probes=true
+measure_result=$(_sni_globalping_measure http www.example.com "$exact_locations" "$fallback_locations")
+check test "$(printf '%s' "$measure_result" | jq -r '._singboxFallback')" = true
+check test "$(wc -l < "$measure_tmp/payloads" | tr -d ' ')" = 8
+check jq -se 'all(.[]; .measurementOptions.protocol == "HTTP2" and .measurementOptions.request.method == "HEAD")' "$measure_tmp/payloads"
+mock_no_probes=false
+command rm -rf "$measure_tmp"
+curl() { printf '%s\n' "$mock_output"; return "$mock_rc"; }
+_sni_globalping_measure() { fixture_measure; }
+fixture='{"status":"finished","probesCount":1,"_singboxFallback":true,"results":[{"probe":{"country":"CN","city":"Guangzhou","asn":4134,"network":"Telecom"},"result":{"status":"finished","statusCode":200,"timings":{"tls":20},"tls":{"authorized":true,"protocol":"TLSv1.3"}}}]}'
+duplicate_carrier_locations='[{"country":"CN","asn":4134,"city":"Beijing","limit":1},{"country":"CN","asn":4134,"city":"Shanghai","limit":1}]'
+result=$(_sni_globalping_http www.example.com "$duplicate_carrier_locations" '')
+check test "$(printf '%s' "$result" | cut -f7)" = partial
 
 ping() { return 1; }
 reject _sni_choose_sources <<< '*'
@@ -160,13 +226,22 @@ menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n3')
 reject grep -q '综合结果 TOP' <<< "$menu"
 check grep -q 'VPS 侧候选结果' <<< "$menu"
 menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n2')
-check grep -q '中国远程探针结果 TOP' <<< "$menu"
+reject grep -q '中国远程探针结果 TOP' <<< "$menu"
 reject grep -q '优先复测候选' <<< "$menu"
+remote_fixture=$'20\t1\tBeijing/Test\tTLSv1.3\t1\t1\tcomplete'
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n2')
+check grep -q '中国远程探针结果 TOP' <<< "$menu"
 mock_org='Cloudflare Inc'
 menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n1')
 reject grep -q '候选结果 TOP' <<< "$menu"
 mock_org=hosting
 _sni_test_domain() { return 1; }
+remote_fixture=$'20\t1\tGuangzhou/Test\tTLSv1.3\t1\t0\tpartial'
+_warn() { printf 'WARN: %s\n' "$*"; }
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n3')
+check grep -q '部分候选已完成远程诊断' <<< "$menu"
+reject grep -q '所有候选域名测试失败' <<< "$menu"
+_warn() { :; }
 remote_fixture=$'20\t1\tBeijing/Test\tTLSv1.3\t1\t1\tcomplete'
 menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n3')
 check grep -q '中国远程探针结果 TOP' <<< "$menu"

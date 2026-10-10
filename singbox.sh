@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="28"
+export SCRIPT_VERSION="29"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -5569,15 +5569,21 @@ _sni_globalping_city() {
 
 _sni_globalping_measure() {
     local measurement_type="$1" target="$2" locations_json="$3" fallback_json="${4:-}"
-    local payload response measurement_id data state i http_code response_file
+    local payload response measurement_id data state http_code response_file
+    local requested_count actual_count usable_count fallback_data fallback_count
     printf '%s' "$locations_json" | jq -e 'type == "array" and length > 0 and length <= 5 and
         all(.[]; .country == "CN" and .limit == 1)' >/dev/null 2>&1 || return 1
     if [ -n "$fallback_json" ]; then
         printf '%s' "$fallback_json" | jq -e 'type == "array" and length > 0 and length <= 5 and
             all(.[]; .country == "CN" and .limit == 1)' >/dev/null 2>&1 || return 1
     fi
-    payload=$(jq -nc --arg type "$measurement_type" --arg target "$target" --argjson locations "$locations_json" \
-        '{type:$type,target:$target,locations:$locations}') || return 1
+    if [ "$measurement_type" = http ]; then
+        payload=$(jq -nc --arg type "$measurement_type" --arg target "$target" --argjson locations "$locations_json" \
+            '{type:$type,target:$target,locations:$locations,measurementOptions:{protocol:"HTTP2",request:{method:"HEAD"}}}') || return 1
+    else
+        payload=$(jq -nc --arg type "$measurement_type" --arg target "$target" --argjson locations "$locations_json" \
+            '{type:$type,target:$target,locations:$locations}') || return 1
+    fi
     response_file=$(mktemp /tmp/sni-globalping.XXXXXX) || return 1
     http_code=$(curl -q -sS --connect-timeout 8 --max-time 15 -X POST \
         -H 'content-type: application/json' -H "user-agent: singbox-lite-sni/${SCRIPT_VERSION}" \
@@ -5585,13 +5591,11 @@ _sni_globalping_measure() {
         'https://api.globalping.io/v1/measurements' 2>/dev/null)
     if [ "$http_code" = 422 ] && [ -n "$fallback_json" ] && \
        jq -e '.error.type == "no_probes_found"' "$response_file" >/dev/null 2>&1; then
-        _warn "所选城市缺少可用探针，回退到同运营商的中国探针；实际城市以结果为准。"
-        payload=$(jq -nc --arg type "$measurement_type" --arg target "$target" --argjson locations "$fallback_json" \
-            '{type:$type,target:$target,locations:$locations}') || { rm -f "$response_file"; return 1; }
-        http_code=$(curl -q -sS --connect-timeout 8 --max-time 15 -X POST \
-            -H 'content-type: application/json' -H "user-agent: singbox-lite-sni/${SCRIPT_VERSION}" \
-            --data "$payload" -o "$response_file" -w '%{http_code}' \
-            'https://api.globalping.io/v1/measurements' 2>/dev/null)
+        rm -f "$response_file"
+        _warn "所选城市缺少可用探针，回退到同运营商中国探针；实际城市以结果为准。"
+        fallback_data=$(_sni_globalping_measure "$measurement_type" "$target" "$fallback_json" '') || return 1
+        printf '%s' "$fallback_data" | jq -c '. + {_singboxFallback:true}'
+        return
     fi
     if [ "$http_code" != 202 ]; then
         _warn "Globalping 创建测量失败（HTTP ${http_code:-网络错误}）。"
@@ -5617,6 +5621,34 @@ _sni_globalping_measure() {
         [[ "$state" == "finished" || "$state" == "failed" ]] && break
     done
     [ "$state" = "finished" ] || return 1
+
+    requested_count=$(printf '%s' "$locations_json" | jq -r 'length')
+    actual_count=$(printf '%s' "$data" | jq -r '(.results // []) | length')
+    usable_count=$(printf '%s' "$data" | jq -r --arg type "$measurement_type" --argjson locations "$locations_json" '
+        [.results[]? | . as $r | select($r.probe.country == "CN") |
+            select(any($locations[]; .asn == $r.probe.asn and
+                (.city == null or ((.city|ascii_downcase) == (($r.probe.city // "")|ascii_downcase))))) |
+            select(if $type == "http" then
+                $r.result.status == "finished" and $r.result.tls.protocol == "TLSv1.3" and
+                $r.result.tls.authorized == true and $r.result.statusCode >= 200 and $r.result.statusCode < 300
+            else $r.result.stats.avg != null end)] | length') || return 1
+    if [ -n "$fallback_json" ] && [ "$usable_count" -lt "$requested_count" ] 2>/dev/null; then
+        _warn "精确城市有效探针不足（${usable_count}/${requested_count}，返回 ${actual_count} 条），尝试同运营商中国探针回退；实际城市以结果为准。"
+        fallback_data=$(_sni_globalping_measure "$measurement_type" "$target" "$fallback_json" '') || fallback_data=''
+        if [ -n "$fallback_data" ]; then
+            fallback_count=$(printf '%s' "$fallback_data" | jq -r --arg type "$measurement_type" --argjson locations "$fallback_json" '
+                [.results[]? | . as $r | select(any($locations[]; .asn == $r.probe.asn)) |
+                    select($r.probe.country == "CN" and
+                        (if $type == "http" then
+                            $r.result.status == "finished" and $r.result.tls.protocol == "TLSv1.3" and
+                            $r.result.tls.authorized == true and $r.result.statusCode >= 200 and $r.result.statusCode < 300
+                        else $r.result.stats.avg != null end))] | length') || fallback_count=0
+            if [ "$fallback_count" -gt "$usable_count" ] 2>/dev/null; then
+                data=$(printf '%s' "$fallback_data" | jq -c '. + {_singboxFallback:true}')
+                _warn "已采用有效探针更多的回退结果（${fallback_count}/${requested_count}）；实际城市以探针返回为准。"
+            fi
+        fi
+    fi
     printf '%s\n' "$data"
 }
 
@@ -5649,19 +5681,27 @@ _sni_globalping_http() {
     requested=$(printf '%s' "$data" | jq -r '.probesCount // 0')
     details=$(printf '%s' "$data" | jq -r '[.results[]? |
         ((.probe.city // "?") + "/" + (.probe.network // "?") + " AS" + ((.probe.asn // 0)|tostring) + " @ " +
-         ((.probe.longitude // 0)|tostring) + "," + ((.probe.latitude // 0)|tostring))] |
+         ((.probe.longitude // 0)|tostring) + "," + ((.probe.latitude // 0)|tostring) +
+         " [TLS=" + (.result.tls.protocol // "unknown") + ", HTTP=" + ((.result.statusCode // "none")|tostring) +
+         ", status=" + (.result.status // "unknown") + "]")] |
         join("; ") | gsub("[\u0000-\u001f\u007f]"; " ")')
     http_good=$(printf '%s' "$data" | jq -r '[.results[]? |
         select(.probe.country == "CN" and .result.tls.protocol == "TLSv1.3" and
         .result.tls.authorized == true and .result.status == "finished" and
         .result.statusCode >= 200 and .result.statusCode < 300)] | length')
     coverage=$(printf '%s' "$data" | jq -r --argjson locations "$2" '
-        .results as $r | [$locations[] | . as $loc |
+        . as $data | .results as $r | [$locations[] | . as $loc |
             any($r[]?; .probe.country == "CN" and .probe.asn == $loc.asn and
-                ($loc.city == null or (((.probe.city // "")|ascii_downcase) == ($loc.city|ascii_downcase))) and
+                ($data._singboxFallback == true or $loc.city == null or (((.probe.city // "")|ascii_downcase) == ($loc.city|ascii_downcase))) and
                 .result.tls.protocol == "TLSv1.3" and .result.tls.authorized == true and
                 .result.status == "finished" and .result.statusCode >= 200 and .result.statusCode < 300)] |
-        if length > 0 and all(. == true) then "complete" else "partial" end') || return 1
+        if length > 0 and all(. == true) and
+            ([$locations[].asn] | group_by(.) | all(.[]; . as $group |
+                ([$r[]? | select(.probe.country == "CN" and .probe.asn == $group[0] and
+                    .result.tls.protocol == "TLSv1.3" and .result.tls.authorized == true and
+                    .result.status == "finished" and .result.statusCode >= 200 and .result.statusCode < 300)] | length) >= ($group | length)))
+        then "complete" else "partial" end') || return 1
+    [ "$(printf '%s' "$data" | jq -r '._singboxFallback // false')" = true ] && [ "$coverage" = complete ] && coverage=complete-fallback
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$avg" "$good" "$details" "$protocols" "$requested" "$http_good" "$coverage"
 }
 
@@ -5809,15 +5849,17 @@ _sni_test_domain() {
                 4) _warn "${domain}: 当前 curl TLS 后端不支持请求的功能（exit 4）。" ;;
                 6) _warn "${domain}: DNS 解析失败。" ;;
                 28) _warn "${domain}: 连接/TLS/HTTP 超时。" ;;
+                35) _warn "${domain}: TLS 握手失败（exit 35），可能为目标拒绝、协议不兼容或线路异常。" ;;
                 60) _warn "${domain}: 证书验证失败。" ;;
                 *) _warn "${domain}: curl 失败（exit ${rc}）。" ;;
             esac
             return 1
         fi
         read -r app connect hv code verify observed <<< "$out"
-        [ "$hv" = 2 ] && [ "$verify" = 0 ] || return 1
+        [ "$verify" = 0 ] || { _warn "${domain}: 证书校验结果 ${verify:-未知}，跳过。"; return 1; }
+        [ "$hv" = 2 ] || { _warn "${domain}: 实际 HTTP/${hv:-未知}，未协商 HTTP/2。"; return 1; }
         # Exclude redirects and WAF/error pages; HEAD-unsupported sites need manual validation.
-        [[ "$code" =~ ^2[0-9][0-9]$ ]] || return 1
+        [[ "$code" =~ ^2[0-9][0-9]$ ]] || { _warn "${domain}: HEAD 返回 HTTP ${code:-未知}（跳转、WAF 或不支持 HEAD 等），按保守策略排除。"; return 1; }
         _sni_public_ipv4 "$observed" || return 1
         [ -z "$ip" ] && { ip="$observed"; resolve_args=(--resolve "${domain}:443:${ip}"); }
         [ "$observed" = "$ip" ] || return 1
@@ -5893,7 +5935,8 @@ _sni_optimizer_menu() {
     echo "  ╚═══════════════════════════════════════╝"
     echo -e "${NC}"
     echo "  本地筛选：证书验证 + TLS 1.3 + HTTP/2 + 非跳转 2xx，IPv4 同 IP 三轮测试。"
-    echo "  远程筛选：从中国运营商探针验证 TLS 1.3 握手；Globalping 不保证提供 HTTP/2 协商结果。"
+    echo "  远程筛选：中国运营商探针发起 HTTP/2 + HEAD；TLS 1.3、证书及 HTTP 状态分别校验。"
+    echo "  注意：远程结果不等于真实客户端到 VPS 的代理吞吐或断流测试。"
     _warn "中国远程模式使用公开探针，结果用于线路筛选；正式使用前仍建议从实际客户端复测。"
     _warn "适用于 VLESS-Reality/Any-Reality。普通 AnyTLS 请使用证书覆盖的自有域名；第三方 SNI 不等于可信伪装。"
     echo ""
@@ -6052,6 +6095,7 @@ _sni_optimizer_menu() {
 
     # 远程请求每个域名最多使用用户选择的五个地点，候选最多五个。
     local remote_domains=() remote_scores=()
+    local remote_diagnostic_count=0
     local remote_candidates="" remote_result remote_avg remote_good remote_details remote_protocols remote_requested remote_http_good remote_coverage
     if [ "$test_mode" = "2" ] || [ "$test_mode" = "3" ]; then
         if [ -z "$source_locations" ] || [ "$source_count" -eq 0 ]; then
@@ -6073,12 +6117,14 @@ _sni_optimizer_menu() {
                     echo -e "${RED}远程探针失败/超时${NC}"
                     continue
                 fi
+                remote_diagnostic_count=$((remote_diagnostic_count + 1))
                 IFS=$'\t' read -r remote_avg remote_good remote_details remote_protocols remote_requested remote_http_good remote_coverage <<< "$remote_result"
                 echo -e "TLS 平均 ${GREEN}${remote_avg}ms${NC}，TLS 成功 ${remote_good}/${remote_requested:-$source_count}，HTTP 2xx ${remote_http_good}/${remote_requested:-$source_count}，协议 ${remote_protocols}"
                 echo "    出发点: ${remote_details}"
-                if [ "$remote_coverage" != complete ] || [ "$remote_requested" -lt "$source_count" ] || [ "$remote_good" -lt "$source_count" ] || [ "$remote_http_good" -lt "$source_count" ]; then
+                [ "$remote_coverage" = complete-fallback ] && _warn "${domain} 使用同运营商回退探针；并非原选城市，实际地点见出发点明细。"
+                if { [ "$remote_coverage" != complete ] && [ "$remote_coverage" != complete-fallback ]; } || [ "$remote_requested" -lt "$source_count" ] || [ "$remote_good" -lt "$source_count" ] || [ "$remote_http_good" -lt "$source_count" ]; then
                     _warn "${domain} 计划 ${source_count} 个出发点，实际 ${remote_requested} 个探针、HTTP 成功 ${remote_http_good}；覆盖不足，仅作诊断，不进入联合排名。"
-                    [ "$test_mode" = 3 ] && continue
+                    continue
                 fi
                 remote_domains+=("$domain")
                 remote_scores+=("$((remote_avg + (source_count - remote_http_good) * 500))")
@@ -6119,7 +6165,12 @@ _sni_optimizer_menu() {
     fi
 
     if [ -z "$results" ]; then
-        _error "所有候选域名测试失败，请检查网络或远程探针状态。"
+        if [ "$remote_diagnostic_count" -gt 0 ]; then
+            _warn "部分候选已完成远程诊断，但未满足完整出发点/HTTP 覆盖或 VPS 本地校验，因此不生成联合排名。"
+            _warn "这不表示所有候选都失败；请换候选域名、调整出发点或稍后重试。"
+        else
+            _error "所有候选域名测试失败，请检查网络或远程探针状态。"
+        fi
         return
     fi
 
