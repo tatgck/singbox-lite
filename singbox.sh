@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="29"
+export SCRIPT_VERSION="30"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -5570,12 +5570,13 @@ _sni_globalping_city() {
 _sni_globalping_measure() {
     local measurement_type="$1" target="$2" locations_json="$3" fallback_json="${4:-}"
     local payload response measurement_id data state http_code response_file
-    local requested_count actual_count usable_count fallback_data fallback_count
+    local requested_count fallback_expected_count actual_count usable_count fallback_data fallback_count
     printf '%s' "$locations_json" | jq -e 'type == "array" and length > 0 and length <= 5 and
         all(.[]; .country == "CN" and .limit == 1)' >/dev/null 2>&1 || return 1
     if [ -n "$fallback_json" ]; then
         printf '%s' "$fallback_json" | jq -e 'type == "array" and length > 0 and length <= 5 and
             all(.[]; .country == "CN" and .limit == 1)' >/dev/null 2>&1 || return 1
+        fallback_expected_count=$(printf '%s' "$fallback_json" | jq -r 'length') || return 1
     fi
     if [ "$measurement_type" = http ]; then
         payload=$(jq -nc --arg type "$measurement_type" --arg target "$target" --argjson locations "$locations_json" \
@@ -5594,7 +5595,8 @@ _sni_globalping_measure() {
         rm -f "$response_file"
         _warn "所选城市缺少可用探针，回退到同运营商中国探针；实际城市以结果为准。"
         fallback_data=$(_sni_globalping_measure "$measurement_type" "$target" "$fallback_json" '') || return 1
-        printf '%s' "$fallback_data" | jq -c '. + {_singboxFallback:true}'
+        printf '%s' "$fallback_data" | jq -c --argjson expected "$fallback_expected_count" --argjson original "$(printf '%s' "$locations_json" | jq -r 'length')" \
+            '. + {_singboxFallback:true,_singboxExpectedCount:$expected,_singboxOriginalExpectedCount:$original}'
         return
     fi
     if [ "$http_code" != 202 ]; then
@@ -5643,9 +5645,11 @@ _sni_globalping_measure() {
                             $r.result.status == "finished" and $r.result.tls.protocol == "TLSv1.3" and
                             $r.result.tls.authorized == true and $r.result.statusCode >= 200 and $r.result.statusCode < 300
                         else $r.result.stats.avg != null end))] | length') || fallback_count=0
-            if [ "$fallback_count" -gt "$usable_count" ] 2>/dev/null; then
-                data=$(printf '%s' "$fallback_data" | jq -c '. + {_singboxFallback:true}')
-                _warn "已采用有效探针更多的回退结果（${fallback_count}/${requested_count}）；实际城市以探针返回为准。"
+            if { [ "$fallback_count" -gt "$usable_count" ] ||
+                 { [ "$fallback_count" -eq "$fallback_expected_count" ] && [ "$usable_count" -lt "$requested_count" ]; }; } 2>/dev/null; then
+                data=$(printf '%s' "$fallback_data" | jq -c --argjson expected "$fallback_expected_count" --argjson original "$requested_count" \
+                    '. + {_singboxFallback:true,_singboxExpectedCount:$expected,_singboxOriginalExpectedCount:$original}')
+                _warn "已采用运营商回退结果（有效运营商 ${fallback_count}/${fallback_expected_count}；原选城市不再精确匹配）。"
             fi
         fi
     fi
@@ -5654,7 +5658,7 @@ _sni_globalping_measure() {
 
 # 输出: 平均 TLS 毫秒<TAB>成功探针数<TAB>探针详情
 _sni_globalping_http() {
-    local data avg good details protocols requested http_good coverage
+    local data avg good details protocols requested expected http_good coverage
     data=$(_sni_globalping_measure http "$1" "$2" "$3") || return 1
     # Reject malformed/incomplete API data before shell arithmetic or TSV parsing.
     printf '%s' "$data" | jq -e '
@@ -5679,6 +5683,7 @@ _sni_globalping_http() {
     protocols=$(printf '%s' "$data" | jq -r '[.results[]? | select(.result.timings.tls != null) |
         (.result.tls.protocol // "unknown")] | unique | join(",")')
     requested=$(printf '%s' "$data" | jq -r '.probesCount // 0')
+    expected=$(printf '%s' "$data" | jq -r --argjson locations "$2" '._singboxExpectedCount // ($locations | length)')
     details=$(printf '%s' "$data" | jq -r '[.results[]? |
         ((.probe.city // "?") + "/" + (.probe.network // "?") + " AS" + ((.probe.asn // 0)|tostring) + " @ " +
          ((.probe.longitude // 0)|tostring) + "," + ((.probe.latitude // 0)|tostring) +
@@ -5690,19 +5695,22 @@ _sni_globalping_http() {
         .result.tls.authorized == true and .result.status == "finished" and
         .result.statusCode >= 200 and .result.statusCode < 300)] | length')
     coverage=$(printf '%s' "$data" | jq -r --argjson locations "$2" '
-        . as $data | .results as $r | [$locations[] | . as $loc |
-            any($r[]?; .probe.country == "CN" and .probe.asn == $loc.asn and
-                ($data._singboxFallback == true or $loc.city == null or (((.probe.city // "")|ascii_downcase) == ($loc.city|ascii_downcase))) and
-                .result.tls.protocol == "TLSv1.3" and .result.tls.authorized == true and
-                .result.status == "finished" and .result.statusCode >= 200 and .result.statusCode < 300)] |
-        if length > 0 and all(. == true) and
-            ([$locations[].asn] | group_by(.) | all(.[]; . as $group |
-                ([$r[]? | select(.probe.country == "CN" and .probe.asn == $group[0] and
-                    .result.tls.protocol == "TLSv1.3" and .result.tls.authorized == true and
-                    .result.status == "finished" and .result.statusCode >= 200 and .result.statusCode < 300)] | length) >= ($group | length)))
-        then "complete" else "partial" end') || return 1
-    [ "$(printf '%s' "$data" | jq -r '._singboxFallback // false')" = true ] && [ "$coverage" = complete ] && coverage=complete-fallback
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$avg" "$good" "$details" "$protocols" "$requested" "$http_good" "$coverage"
+        def valid($r):
+            $r.probe.country == "CN" and $r.result.tls.protocol == "TLSv1.3" and
+            $r.result.tls.authorized == true and $r.result.status == "finished" and
+            $r.result.statusCode >= 200 and $r.result.statusCode < 300;
+        . as $data | .results as $r |
+        if $data._singboxFallback == true then
+            ([$locations[].asn] | unique) as $asns |
+            [$asns[] | . as $asn | any($r[]?; .probe.asn == $asn and valid(.))] |
+            if length > 0 and all(. == true) then "complete-fallback" else "partial-fallback" end
+        else
+            [$locations[] | . as $loc | any($r[]?;
+                .probe.asn == $loc.asn and
+                ($loc.city == null or (((.probe.city // "")|ascii_downcase) == ($loc.city|ascii_downcase))) and valid(.))] |
+            if length > 0 and all(. == true) then "complete" else "partial" end
+        end') || return 1
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$avg" "$good" "$details" "$protocols" "$requested" "$http_good" "$coverage" "$expected"
 }
 
 _sni_globalping_ping_vps() {
@@ -5728,6 +5736,7 @@ _sni_choose_sources() {
     SNI_SOURCE_SELECTED_COUNT=0
     SNI_SOURCE_LABEL=''
     SNI_SOURCE_FALLBACK_LOCATIONS=''
+    SNI_SOURCE_CARRIER_COUNT=0
 
     while IFS= read -r row; do
         rows+=("$row")
@@ -5784,7 +5793,7 @@ _sni_choose_sources() {
         elif command -v ping >/dev/null 2>&1; then
             ping_state="不可达/禁 ICMP"
         fi
-        echo "  已选: ${carrier} ${city} ${ip} (${lon},${lat})，本机 ping: ${ping_state}"
+        echo "  已选 #${idx}: ${carrier} ${city} ${ip} (${lon},${lat})，本机 ping: ${ping_state}"
         echo "       地图: https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=8/${lat}/${lon}"
         labels="${labels}${labels:+；}${carrier}/${city} ${ip} (${lon},${lat})"
         local globalping_city
@@ -5808,6 +5817,7 @@ _sni_choose_sources() {
     SNI_SOURCE_LOCATIONS="$source_locations"
     SNI_SOURCE_FALLBACK_LOCATIONS="$fallback_locations"
     SNI_SOURCE_COUNT=$(echo "$source_locations" | jq 'length')
+    SNI_SOURCE_CARRIER_COUNT=$(echo "$fallback_locations" | jq 'length')
     SNI_SOURCE_SELECTED_COUNT="${#selected[@]}"
     SNI_SOURCE_LABEL="$labels"
 }
@@ -5960,6 +5970,7 @@ _sni_optimizer_menu() {
     local source_count=0
     local source_fallback_locations=""
     local source_selected_count=0
+    local source_carrier_count=0
     local source_label=""
     local candidate_input candidate_file
     case "$region_choice" in
@@ -6020,6 +6031,7 @@ _sni_optimizer_menu() {
         1|2|3) ;;
         *) _warn "测试方式无效，使用 VPS + 中国远程出发点。"; test_mode="3" ;;
     esac
+    local requested_test_mode="$test_mode"
     if [ "$test_mode" = 2 ]; then
         _warn "仅远程模式不执行本地证书/H2/CDN 校验；CDN 排除策略未验证，只展示线路诊断结果。"
     fi
@@ -6029,8 +6041,9 @@ _sni_optimizer_menu() {
         source_fallback_locations="$SNI_SOURCE_FALLBACK_LOCATIONS"
         source_count="$SNI_SOURCE_COUNT"
         source_selected_count="$SNI_SOURCE_SELECTED_COUNT"
+        source_carrier_count="$SNI_SOURCE_CARRIER_COUNT"
         source_label="$SNI_SOURCE_LABEL"
-        _info "已选 ${source_selected_count} 条参考线路；实际请求 ${source_count} 个中国运营商探针。"
+        _info "已选 ${source_selected_count} 个城市参考点，覆盖 ${source_carrier_count} 家运营商；先精确请求 ${source_count} 个城市探针，缺失时按运营商回退。"
     fi
     if [ "$test_mode" != "1" ]; then
         [ -z "$server_ip" ] && _init_server_ip >/dev/null 2>&1
@@ -6060,12 +6073,17 @@ _sni_optimizer_menu() {
     echo ""
 
     local results=""
+    local candidate_count=0 local_pass_count=0 local_excluded_count=0
+    local local_failed_count=0 local_failures="" local_exclusions=""
     local domain result avg jitter h2 ok score target_ip cname target_meta cdn_status
+    candidate_count=$(printf '%s\n' $pool | awk 'NF {count++} END {print count+0}')
     if [ "$test_mode" != "2" ]; then
         for domain in $pool; do
             printf '  测试 %-28s ... ' "$domain"
             result=$(_sni_test_domain "$domain")
             if [ -z "$result" ]; then
+                local_failed_count=$((local_failed_count + 1))
+                local_failures="${local_failures}${domain}\t未通过严格校验（具体原因见上方 [注意]）\n"
                 echo -e "${RED}未通过证书/TLS1.3/H2/HTTP/稳定性校验${NC}"
                 continue
             fi
@@ -6085,9 +6103,12 @@ _sni_optimizer_menu() {
                     " 同ASN=" + (($v.asn != null and $v.asn == $t.asn)|tostring)')"
             fi
             if [ "$cdn_status" = detected ] && [[ "$exclude_cdn" != n && "$exclude_cdn" != N ]]; then
+                local_excluded_count=$((local_excluded_count + 1))
+                local_exclusions="${local_exclusions}${domain}\t检测到 CDN/WAF，按本次策略排除\n"
                 _warn "${domain} 检测到 CDN/WAF，按本次策略排除。"; continue
             fi
             # Locality is displayed as evidence, not guessed from a domain TLD.
+            local_pass_count=$((local_pass_count + 1))
             score=$((avg + jitter))
             results="${results}${score}\t${domain}\t${avg}\t${jitter}\t${h2}\n"
         done
@@ -6096,7 +6117,11 @@ _sni_optimizer_menu() {
     # 远程请求每个域名最多使用用户选择的五个地点，候选最多五个。
     local remote_domains=() remote_scores=()
     local remote_diagnostic_count=0
-    local remote_candidates="" remote_result remote_avg remote_good remote_details remote_protocols remote_requested remote_http_good remote_coverage
+    local remote_diagnostics=""
+    local remote_attempted_count=0 remote_complete_count=0 remote_failed_count=0
+    local remote_failures=""
+    local remote_skipped_count=0 remote_skipped=""
+    local remote_candidates="" remote_result remote_avg remote_good remote_details remote_protocols remote_requested remote_http_good remote_coverage remote_expected coverage_unit
     if [ "$test_mode" = "2" ] || [ "$test_mode" = "3" ]; then
         if [ -z "$source_locations" ] || [ "$source_count" -eq 0 ]; then
             _warn "没有可用的远程出发点，跳过 Globalping 测试。"
@@ -6107,27 +6132,45 @@ _sni_optimizer_menu() {
                 # 远程模式也只取前 5 个候选，避免一次菜单操作产生过多外部请求。
                 remote_candidates=$(printf '%s\n' $pool | head -5)
             fi
+            local pool_domain remote_domain selected_for_remote
+            for pool_domain in $pool; do
+                selected_for_remote=false
+                for remote_domain in $remote_candidates; do
+                    [ "$pool_domain" = "$remote_domain" ] && { selected_for_remote=true; break; }
+                done
+                if [ "$selected_for_remote" = false ]; then
+                    remote_skipped_count=$((remote_skipped_count + 1))
+                    remote_skipped="${remote_skipped}${pool_domain}\n"
+                fi
+            done
             echo ""
-            _info "开始中国远程探测（最多 5 个候选，每个候选请求 ${source_count} 个运营商探针）..."
+            _info "开始中国远程探测（最多 5 个候选；精确城市 ${source_count} 个，运营商回退 ${source_carrier_count} 个）..."
             local remote_results=""
             for domain in $remote_candidates; do
+                remote_attempted_count=$((remote_attempted_count + 1))
                 printf '  远程测试 %-25s ... ' "$domain"
                 remote_result=$(_sni_globalping_http "$domain" "$source_locations" "$source_fallback_locations")
                 if [ -z "$remote_result" ]; then
+                    remote_failed_count=$((remote_failed_count + 1))
+                    remote_failures="${remote_failures}${domain}\t未取得有效结果（API/超时/证书/TLS1.3）\n"
                     echo -e "${RED}远程探针失败/超时${NC}"
                     continue
                 fi
-                remote_diagnostic_count=$((remote_diagnostic_count + 1))
-                IFS=$'\t' read -r remote_avg remote_good remote_details remote_protocols remote_requested remote_http_good remote_coverage <<< "$remote_result"
-                echo -e "TLS 平均 ${GREEN}${remote_avg}ms${NC}，TLS 成功 ${remote_good}/${remote_requested:-$source_count}，HTTP 2xx ${remote_http_good}/${remote_requested:-$source_count}，协议 ${remote_protocols}"
+                IFS=$'\t' read -r remote_avg remote_good remote_details remote_protocols remote_requested remote_http_good remote_coverage remote_expected <<< "$remote_result"
+                remote_expected=${remote_expected:-$source_count}
+                echo -e "TLS 平均 ${GREEN}${remote_avg}ms${NC}，TLS 成功 ${remote_good}/${remote_expected}，HTTP 2xx ${remote_http_good}/${remote_expected}，实际返回 ${remote_requested} 个探针，协议 ${remote_protocols}"
                 echo "    出发点: ${remote_details}"
                 [ "$remote_coverage" = complete-fallback ] && _warn "${domain} 使用同运营商回退探针；并非原选城市，实际地点见出发点明细。"
-                if { [ "$remote_coverage" != complete ] && [ "$remote_coverage" != complete-fallback ]; } || [ "$remote_requested" -lt "$source_count" ] || [ "$remote_good" -lt "$source_count" ] || [ "$remote_http_good" -lt "$source_count" ]; then
-                    _warn "${domain} 计划 ${source_count} 个出发点，实际 ${remote_requested} 个探针、HTTP 成功 ${remote_http_good}；覆盖不足，仅作诊断，不进入联合排名。"
+                case "$remote_coverage" in *-fallback) coverage_unit="运营商" ;; *) coverage_unit="城市" ;; esac
+                if { [ "$remote_coverage" != complete ] && [ "$remote_coverage" != complete-fallback ]; } || [ "$remote_good" -lt "$remote_expected" ] || [ "$remote_http_good" -lt "$remote_expected" ]; then
+                    remote_diagnostic_count=$((remote_diagnostic_count + 1))
+                    remote_diagnostics="${remote_diagnostics}${remote_http_good}\t${remote_good}\t${remote_avg}\t${domain}\t${remote_expected}\t${remote_requested}\t${remote_coverage}\n"
+                    _warn "${domain} 期望覆盖 ${remote_expected} 个${coverage_unit}出发点，实际返回 ${remote_requested} 个探针、HTTP 成功 ${remote_http_good}；覆盖不足，仅作诊断，不进入正式排名。"
                     continue
                 fi
+                remote_complete_count=$((remote_complete_count + 1))
                 remote_domains+=("$domain")
-                remote_scores+=("$((remote_avg + (source_count - remote_http_good) * 500))")
+                remote_scores+=("$((remote_avg + (remote_expected - remote_http_good) * 500))")
                 remote_results="${remote_results}${remote_scores[${#remote_scores[@]}-1]}\t${domain}\t${remote_avg}\t0\t-\t${remote_avg}\n"
             done
 
@@ -6138,8 +6181,12 @@ _sni_optimizer_menu() {
                 results="$remote_results"
                 test_mode="2"
             elif [ -z "$remote_results" ]; then
-                _warn "中国远程探针无完整覆盖结果，仅展示 VPS 本地结果，不代表联合测试通过。"
-                test_mode="1"
+                if [ -n "$results" ]; then
+                    _warn "中国远程探针无完整覆盖结果，仅展示 VPS 本地结果，不代表联合测试通过。"
+                    test_mode="1"
+                else
+                    _warn "中国远程探针无完整覆盖结果；将在结尾保留部分覆盖和失败明细。"
+                fi
             fi
 
             # 远程模式下，将远程 TLS 延迟和丢失探针惩罚加到本地评分。
@@ -6165,18 +6212,75 @@ _sni_optimizer_menu() {
     fi
 
     if [ -z "$results" ]; then
+        echo ""
+        echo -e "${YELLOW}════════════ 本轮 SNI 筛选结论 ════════════${NC}"
+        echo -e "  ${RED}结论：本轮没有可直接应用的 SNI 候选。${NC}"
+        if [ "$requested_test_mode" != "2" ]; then
+            printf '  VPS 本地严格校验: %s/%s 通过，%s 个未通过' "$local_pass_count" "$candidate_count" "$local_failed_count"
+            [ "$local_excluded_count" -gt 0 ] && printf '，%s 个因 CDN/WAF 策略排除' "$local_excluded_count"
+            echo ""
+        fi
+        if [ "$remote_attempted_count" -gt 0 ]; then
+            printf '  中国远程探测: %s/%s 个候选已尝试，%s 个完整覆盖，%s 个部分覆盖，%s 个无有效结果\n' \
+                "$remote_attempted_count" "$candidate_count" "$remote_complete_count" "$remote_diagnostic_count" "$remote_failed_count"
+            if [ "$remote_skipped_count" -gt 0 ]; then
+                printf '  未进入远程阶段: %s 个（每轮最多 5 个；优先测试 VPS 本地通过项，本地全失败时取前 5 个）\n' \
+                    "$remote_skipped_count"
+                printf '    %s\n' "$(printf '%b' "$remote_skipped" | paste -sd ' ' -)"
+            fi
+        fi
         if [ "$remote_diagnostic_count" -gt 0 ]; then
             _warn "部分候选已完成远程诊断，但未满足完整出发点/HTTP 覆盖或 VPS 本地校验，因此不生成联合排名。"
-            _warn "这不表示所有候选都失败；请换候选域名、调整出发点或稍后重试。"
-        else
-            _error "所有候选域名测试失败，请检查网络或远程探针状态。"
+            if [ -n "$remote_diagnostics" ]; then
+                echo ""
+                echo -e "${YELLOW}════ 远程诊断候选（仅供复测，不是正式推荐）════${NC}"
+                local diagnostic_http diagnostic_tls diagnostic_avg diagnostic_domain diagnostic_expected diagnostic_returned diagnostic_coverage
+                while IFS=$'\t' read -r diagnostic_http diagnostic_tls diagnostic_avg diagnostic_domain diagnostic_expected diagnostic_returned diagnostic_coverage; do
+                    [ -n "$diagnostic_domain" ] || continue
+                    printf '  %-28s HTTP 2xx %s/%s，TLS1.3 %s/%s，平均 %sms，返回 %s 个探针，覆盖=%s\n' \
+                        "$diagnostic_domain" "$diagnostic_http" "$diagnostic_expected" "$diagnostic_tls" "$diagnostic_expected" \
+                        "$diagnostic_avg" "$diagnostic_returned" "$diagnostic_coverage"
+                done <<< "$(echo -e "$remote_diagnostics" | grep -v '^$' | sort -t $'\t' -k1,1nr -k2,2nr -k3,3n)"
+            fi
+            _warn "请优先复测 HTTP 2xx/TLS 成功数最多的候选；若 VPS 本地仍超时，不要直接应用。"
         fi
+        if [ -n "$remote_failures" ]; then
+            echo ""
+            echo -e "${YELLOW}════ 远程未完成候选 ════${NC}"
+            while IFS=$'\t' read -r domain result; do
+                [ -n "$domain" ] || continue
+                printf '  %-28s %s\n' "$domain" "$result"
+            done <<< "$(echo -e "$remote_failures")"
+        fi
+        if [ -n "$local_failures" ]; then
+            echo ""
+            echo -e "${YELLOW}════ VPS 本地未通过候选 ════${NC}"
+            while IFS=$'\t' read -r domain result; do
+                [ -n "$domain" ] || continue
+                printf '  %-28s %s\n' "$domain" "$result"
+            done <<< "$(echo -e "$local_failures")"
+        fi
+        if [ -n "$local_exclusions" ]; then
+            echo ""
+            echo -e "${YELLOW}════ VPS 本地 CDN/WAF 排除候选 ════${NC}"
+            while IFS=$'\t' read -r domain result; do
+                [ -n "$domain" ] || continue
+                printf '  %-28s %s\n' "$domain" "$result"
+            done <<< "$(echo -e "$local_exclusions")"
+        fi
+        if [ "$requested_test_mode" != "1" ] && [ "$remote_diagnostic_count" -eq 0 ] && \
+           [ "$remote_complete_count" -eq 0 ] && [ "$remote_failed_count" -eq 0 ]; then
+            _warn "没有取得可评分的远程结果；请检查出发点、Globalping 状态或稍后重试。"
+        elif [ "$requested_test_mode" = "1" ]; then
+            _warn "本轮仅执行 VPS 本地测试；请更换候选域名后重试。"
+        fi
+        echo -e "${YELLOW}═══════════════════════════════════════════${NC}"
         return
     fi
 
     echo ""
     [ "$test_mode" = "1" ] && echo -e "${YELLOW}═════════════ VPS 侧候选结果 TOP 5（最佳在最后）═════════════${NC}"
-    [ "$test_mode" = "2" ] && echo -e "${YELLOW}══════ 中国远程探针结果 TOP 5（最佳在最后）══════${NC}"
+    [ "$test_mode" = "2" ] && echo -e "${YELLOW}════ 中国远程复测候选 TOP 5（不代表 VPS 本地通过）════${NC}"
     [ "$test_mode" = "3" ] && echo -e "${YELLOW}══════ VPS + 中国远程探针综合结果 TOP 5（最佳在最后）══════${NC}"
     # 取综合评分前 5，倒序展示。
     local top5=$(echo -e "$results" | grep -v '^$' | sort -n | head -5 | sort -rn)
@@ -6193,12 +6297,62 @@ _sni_optimizer_menu() {
         rank=$((rank - 1))
     done <<< "$top5"
     echo -e "${YELLOW}═══════════════════════════════════════════════════════${NC}"
+    if [ -n "$remote_diagnostics" ]; then
+        echo ""
+        echo -e "${YELLOW}════ 其余远程诊断候选（仅供复测）════${NC}"
+        local diagnostic_http diagnostic_tls diagnostic_avg diagnostic_domain diagnostic_expected diagnostic_returned diagnostic_coverage
+        while IFS=$'\t' read -r diagnostic_http diagnostic_tls diagnostic_avg diagnostic_domain diagnostic_expected diagnostic_returned diagnostic_coverage; do
+            [ -n "$diagnostic_domain" ] || continue
+            printf '  %-28s HTTP 2xx %s/%s，TLS1.3 %s/%s，平均 %sms，返回 %s 个探针，覆盖=%s\n' \
+                "$diagnostic_domain" "$diagnostic_http" "$diagnostic_expected" "$diagnostic_tls" "$diagnostic_expected" \
+                "$diagnostic_avg" "$diagnostic_returned" "$diagnostic_coverage"
+        done <<< "$(echo -e "$remote_diagnostics" | grep -v '^$' | sort -t $'\t' -k1,1nr -k2,2nr -k3,3n)"
+    fi
+    if [ -n "$remote_failures" ]; then
+        echo ""
+        echo -e "${YELLOW}════ 远程未完成候选 ════${NC}"
+        while IFS=$'\t' read -r domain result; do
+            [ -n "$domain" ] || continue
+            printf '  %-28s %s\n' "$domain" "$result"
+        done <<< "$(echo -e "$remote_failures")"
+    fi
+    if [ "$remote_skipped_count" -gt 0 ]; then
+        echo ""
+        printf '[信息] 未进入远程阶段（每轮最多 5 个）: %s\n' \
+            "$(printf '%b' "$remote_skipped" | paste -sd ' ' -)"
+    fi
+    echo ""
+    if [ "$requested_test_mode" = "2" ]; then
+        printf '[信息] 本轮汇总：远程完整覆盖候选 %s 个，部分覆盖诊断 %s 个，无有效结果 %s 个；VPS 本地未参与测试。\n' \
+            "$remote_complete_count" "$remote_diagnostic_count" "$remote_failed_count"
+    elif [ "$requested_test_mode" = "3" ]; then
+        printf '[信息] 本轮汇总：VPS 本地通过 %s/%s（未通过 %s，CDN/WAF 排除 %s）；远程尝试 %s 个（完整覆盖 %s，部分覆盖 %s，无有效结果 %s）。\n' \
+            "$local_pass_count" "$candidate_count" "$local_failed_count" "$local_excluded_count" \
+            "$remote_attempted_count" "$remote_complete_count" "$remote_diagnostic_count" "$remote_failed_count"
+    else
+        printf '[信息] 本轮汇总：VPS 本地严格校验通过 %s/%s，未通过 %s，CDN/WAF 策略排除 %s。\n' \
+            "$local_pass_count" "$candidate_count" "$local_failed_count" "$local_excluded_count"
+    fi
+    if [ -n "$local_failures" ]; then
+        echo -e "${YELLOW}════ VPS 本地未通过候选 ════${NC}"
+        while IFS=$'\t' read -r domain result; do
+            [ -n "$domain" ] || continue
+            printf '  %-28s %s\n' "$domain" "$result"
+        done <<< "$(echo -e "$local_failures")"
+    fi
+    if [ -n "$local_exclusions" ]; then
+        echo -e "${YELLOW}════ VPS 本地 CDN/WAF 排除候选 ════${NC}"
+        while IFS=$'\t' read -r domain result; do
+            [ -n "$domain" ] || continue
+            printf '  %-28s %s\n' "$domain" "$result"
+        done <<< "$(echo -e "$local_exclusions")"
+    fi
     echo ""
     [ "$test_mode" = "1" ] && _info "本次结果仅代表 VPS 侧测试；用于节点前，请从中国客户端实际复测。"
     [ "$test_mode" != "1" ] && _info "远程结果来自 Globalping 中国运营商探针；探针城市、网络和经纬度已在测试时显示。"
     [ "$test_mode" != "1" ] && _info "已选出发点：${source_label}"
     _warn "这不是端到端代理吞吐/断流测试，也不是不会被封或不会被回落滥用的保证。"
-    _info "通过验证后可用于：主菜单 [5] 修改节点 SNI，或 [18] 中转菜单 [7] 修改中转入口 SNI。"
+    _info "从实际客户端复测通过后，再到主菜单 [5] 修改节点 SNI，或 [18] 中转菜单 [7] 修改中转入口 SNI。"
 }
 
 _download_update_file() {

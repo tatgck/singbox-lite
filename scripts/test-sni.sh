@@ -126,8 +126,12 @@ mock_no_probes=false
 command rm -rf "$measure_tmp"
 curl() { printf '%s\n' "$mock_output"; return "$mock_rc"; }
 _sni_globalping_measure() { fixture_measure; }
-fixture='{"status":"finished","probesCount":1,"_singboxFallback":true,"results":[{"probe":{"country":"CN","city":"Guangzhou","asn":4134,"network":"Telecom"},"result":{"status":"finished","statusCode":200,"timings":{"tls":20},"tls":{"authorized":true,"protocol":"TLSv1.3"}}}]}'
+fixture='{"status":"finished","probesCount":1,"_singboxFallback":true,"_singboxExpectedCount":1,"_singboxOriginalExpectedCount":2,"results":[{"probe":{"country":"CN","city":"Guangzhou","asn":4134,"network":"Telecom"},"result":{"status":"finished","statusCode":200,"timings":{"tls":20},"tls":{"authorized":true,"protocol":"TLSv1.3"}}}]}'
 duplicate_carrier_locations='[{"country":"CN","asn":4134,"city":"Beijing","limit":1},{"country":"CN","asn":4134,"city":"Shanghai","limit":1}]'
+result=$(_sni_globalping_http www.example.com "$duplicate_carrier_locations" '')
+check test "$(printf '%s' "$result" | cut -f7)" = complete-fallback
+check test "$(printf '%s' "$result" | cut -f8)" = 1
+fixture=$(printf '%s' "$fixture" | jq 'del(._singboxFallback,._singboxExpectedCount,._singboxOriginalExpectedCount)')
 result=$(_sni_globalping_http www.example.com "$duplicate_carrier_locations" '')
 check test "$(printf '%s' "$result" | cut -f7)" = partial
 
@@ -136,7 +140,13 @@ reject _sni_choose_sources <<< '*'
 _sni_choose_sources <<< '08,09,10,11,12,13,08' >/dev/null
 check test "$SNI_SOURCE_COUNT" = 5
 check test "$SNI_SOURCE_SELECTED_COUNT" = 5
+check test "$SNI_SOURCE_CARRIER_COUNT" = 1
 check test "$(printf '%s' "$SNI_SOURCE_LOCATIONS" | jq -r '.[0].city')" = Luoyang
+_sni_choose_sources <<< '3 20 26' >/dev/null
+check test "$SNI_SOURCE_COUNT" = 3
+check test "$SNI_SOURCE_CARRIER_COUNT" = 3
+check test "$(printf '%s' "$SNI_SOURCE_LOCATIONS" | jq -r '.[1].asn')" = 4837
+check test "$(printf '%s' "$SNI_SOURCE_LOCATIONS" | jq -r '.[1].city')" = Shanghai
 
 # SNI edit must restore server config AND client metadata/YAML on a write/restart error.
 task_tmp=$(mktemp -d /tmp/sni-tests.XXXXXX)
@@ -212,7 +222,7 @@ _sni_test_domain() { printf '20\t0\t✓\t3\t45.60.35.24\n'; }
 _sni_choose_sources() {
     SNI_SOURCE_LOCATIONS='[{"country":"CN","asn":4134,"city":"Beijing","limit":1}]'
     SNI_SOURCE_FALLBACK_LOCATIONS='[{"country":"CN","asn":4134,"limit":1}]'
-    SNI_SOURCE_COUNT=1 SNI_SOURCE_SELECTED_COUNT=1 SNI_SOURCE_LABEL=Beijing
+    SNI_SOURCE_COUNT=1 SNI_SOURCE_SELECTED_COUNT=1 SNI_SOURCE_CARRIER_COUNT=1 SNI_SOURCE_LABEL=Beijing
 }
 _sni_globalping_http() { printf '%s\n' "$remote_fixture"; }
 _init_server_ip() { server_ip=127.0.0.1; }
@@ -221,16 +231,17 @@ remote_fixture=$'20\t1\tBeijing/Test\tTLSv1.3\t1\t1\tcomplete'
 menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n3')
 check test "$(printf '%s' "$menu" | grep -c '综合结果 TOP')" = 1
 check test "$(printf '%s' "$menu" | grep -c '优先复测候选')" = 1
+check grep -q '完整覆盖 1，部分覆盖 0，无有效结果 0' <<< "$menu"
 remote_fixture=$'20\t1\tGuangzhou/Test\tTLSv1.3\t1\t1\tpartial'
 menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n3')
 reject grep -q '综合结果 TOP' <<< "$menu"
 check grep -q 'VPS 侧候选结果' <<< "$menu"
 menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n2')
-reject grep -q '中国远程探针结果 TOP' <<< "$menu"
+reject grep -q '中国远程复测候选 TOP' <<< "$menu"
 reject grep -q '优先复测候选' <<< "$menu"
 remote_fixture=$'20\t1\tBeijing/Test\tTLSv1.3\t1\t1\tcomplete'
 menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n2')
-check grep -q '中国远程探针结果 TOP' <<< "$menu"
+check grep -q '中国远程复测候选 TOP' <<< "$menu"
 mock_org='Cloudflare Inc'
 menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n1')
 reject grep -q '候选结果 TOP' <<< "$menu"
@@ -240,10 +251,71 @@ remote_fixture=$'20\t1\tGuangzhou/Test\tTLSv1.3\t1\t0\tpartial'
 _warn() { printf 'WARN: %s\n' "$*"; }
 menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n3')
 check grep -q '部分候选已完成远程诊断' <<< "$menu"
+check grep -q '本轮没有可直接应用的 SNI 候选' <<< "$menu"
+check grep -q 'VPS 本地严格校验: 0/1 通过' <<< "$menu"
+check grep -q '中国远程探测: 1/1 个候选已尝试，0 个完整覆盖，1 个部分覆盖，0 个无有效结果' <<< "$menu"
+check grep -q '远程诊断候选（仅供复测' <<< "$menu"
+check grep -q 'www.example.com.*HTTP 2xx 0/1' <<< "$menu"
 reject grep -q '所有候选域名测试失败' <<< "$menu"
+remote_fixture=''
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n3')
+check grep -q '本轮没有可直接应用的 SNI 候选' <<< "$menu"
+check grep -q '中国远程探测: 1/1 个候选已尝试，0 个完整覆盖，0 个部分覆盖，1 个无有效结果' <<< "$menu"
+check grep -q '远程未完成候选' <<< "$menu"
+check grep -q 'www.example.com.*API/超时/证书/TLS1.3' <<< "$menu"
 _warn() { :; }
 remote_fixture=$'20\t1\tBeijing/Test\tTLSv1.3\t1\t1\tcomplete'
 menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n3')
-check grep -q '中国远程探针结果 TOP' <<< "$menu"
+check grep -q '中国远程复测候选 TOP' <<< "$menu"
 reject grep -q '优先复测候选' <<< "$menu"
+
+# Local-only failures must not suggest a Globalping problem.
+_warn() { printf 'WARN: %s\n' "$*"; }
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n1')
+check grep -q '本轮仅执行 VPS 本地测试' <<< "$menu"
+reject grep -q '检查出发点、Globalping' <<< "$menu"
+reject grep -q '中国远程探测:' <<< "$menu"
+
+# Remote-only failures must not claim that VPS local validation ran.
+remote_fixture=''
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n2')
+check grep -q '中国远程探测: 1/1 个候选已尝试，0 个完整覆盖，0 个部分覆盖，1 个无有效结果' <<< "$menu"
+reject grep -q 'VPS 本地严格校验:' <<< "$menu"
+
+# Preserve complete, partial and failed remote outcomes in one final report.
+_sni_test_domain() { printf '20\t0\t✓\t3\t45.60.35.24\n'; }
+_sni_globalping_http() {
+    case "$1" in
+        one.example.com) printf '20\t1\tBeijing/Test\tTLSv1.3\t1\t1\tcomplete\t1\n' ;;
+        two.example.com) printf '30\t1\tShanghai/Test\tTLSv1.3\t1\t0\tpartial\t1\n' ;;
+        *) return 1 ;;
+    esac
+}
+menu=$(_sni_optimizer_menu <<< $'5\none.example.com two.example.com three.example.com\nY\n3')
+check grep -q '综合结果 TOP' <<< "$menu"
+check grep -q 'two.example.com.*HTTP 2xx 0/1' <<< "$menu"
+check grep -q 'three.example.com.*API/超时/证书/TLS1.3' <<< "$menu"
+check grep -q '远程尝试 3 个（完整覆盖 1，部分覆盖 1，无有效结果 1）' <<< "$menu"
+
+# Reproduce the reported Singapore run: Singtel stays visible as the best
+# partial diagnostic, failures stay listed, and candidates 6-8 are named.
+_sni_test_domain() { return 1; }
+_sni_globalping_http() {
+    case "$1" in
+        www.singaporeair.com) printf '73\t1\tShanghai/Mobile\tTLSv1.3\t1\t0\tpartial\t3\n' ;;
+        www.singtel.com) printf '159\t2\tGuilin/Telecom; Guangzhou/Mobile\tTLSv1.3\t2\t2\tpartial-fallback\t3\n' ;;
+        www.starhub.com) printf '245\t1\tShanghai/Mobile\tTLSv1.3\t1\t0\tpartial\t3\n' ;;
+        *) return 1 ;;
+    esac
+}
+sg_pool='www.singaporeair.com www.dbs.com.sg www.sgx.com www.singtel.com www.starhub.com www.uob.com.sg www.capitaland.com www.grab.com'
+menu=$(_sni_optimizer_menu <<< "$(printf '5\n%s\nY\n3\n' "$sg_pool")")
+check grep -q '中国远程探测: 5/8 个候选已尝试，0 个完整覆盖，3 个部分覆盖，2 个无有效结果' <<< "$menu"
+check grep -q 'www.singtel.com.*HTTP 2xx 2/3.*TLS1.3 2/3.*覆盖=partial-fallback' <<< "$menu"
+check grep -q 'www.dbs.com.sg.*API/超时/证书/TLS1.3' <<< "$menu"
+check grep -q 'www.sgx.com.*API/超时/证书/TLS1.3' <<< "$menu"
+check grep -q '未进入远程阶段: 3 个' <<< "$menu"
+check grep -q 'www.uob.com.sg www.capitaland.com www.grab.com' <<< "$menu"
+first_diagnostic=$(printf '%s' "$menu" | sed -n '/════ 远程诊断候选/,/请优先复测/p' | grep 'HTTP 2xx' | head -1)
+check grep -q 'www.singtel.com' <<< "$first_diagnostic"
 printf 'PASS: %s checks (mocked network and config writes)\n' "$tests"
