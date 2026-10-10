@@ -229,60 +229,60 @@ _sni_globalping_http() { printf '%s\n' "$remote_fixture"; }
 _init_server_ip() { server_ip=127.0.0.1; }
 server_ip=127.0.0.1 mock_org=hosting
 remote_fixture=$'20\t1\tBeijing/Test\tTLSv1.3\t1\t1\tcomplete'
-menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n3')
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\n3\nY')
 check test "$(printf '%s' "$menu" | grep -c '综合结果 TOP')" = 1
 check test "$(printf '%s' "$menu" | grep -c '本轮复测候选')" = 1
 check grep -q '仅 1 个候选进入本轮排名' <<< "$menu"
 check grep -q '完整覆盖 1，部分覆盖 0，无有效结果 0' <<< "$menu"
 remote_fixture=$'20\t1\tGuangzhou/Test\tTLSv1.3\t1\t1\tpartial'
-menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n3')
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\n3\nY')
 reject grep -q '综合结果 TOP' <<< "$menu"
 check grep -q 'VPS 侧候选结果' <<< "$menu"
-menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n2')
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\n2')
 reject grep -q '中国远程复测候选 TOP' <<< "$menu"
 reject grep -q '优先复测候选' <<< "$menu"
 remote_fixture=$'20\t1\tBeijing/Test\tTLSv1.3\t1\t1\tcomplete'
-menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n2')
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\n2')
 check grep -q '中国远程复测候选 TOP' <<< "$menu"
 mock_org='Cloudflare Inc'
-menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n1')
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\n1\nY')
 reject grep -q '候选结果 TOP' <<< "$menu"
 mock_org=hosting
 _sni_test_domain() { return 1; }
 remote_fixture=$'20\t1\tGuangzhou/Test\tTLSv1.3\t1\t0\tpartial'
 _warn() { printf 'WARN: %s\n' "$*"; }
-menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n3')
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\n3\nY')
 check grep -q '本轮没有可直接应用的 SNI 候选' <<< "$menu"
 check grep -q 'VPS 本地严格校验: 0/1 通过' <<< "$menu"
 check grep -q '中国远程探测: 0/1 个候选已尝试' <<< "$menu"
 check grep -q '本地无通过项，跳过候选远程请求' <<< "$menu"
 reject grep -q '远程测试 www.example.com' <<< "$menu"
-menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n2')
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\n2')
 check grep -q '远程诊断候选（仅供复测' <<< "$menu"
 check grep -q 'www.example.com.*HTTP 2xx 0/1' <<< "$menu"
 reject grep -q '所有候选域名测试失败' <<< "$menu"
 remote_fixture=''
-menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n2')
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\n2')
 check grep -q '本轮没有可直接应用的 SNI 候选' <<< "$menu"
 check grep -q '中国远程探测: 1/1 个候选已尝试，0 个完整覆盖，0 个部分覆盖，1 个无有效结果' <<< "$menu"
 check grep -q '远程未完成候选' <<< "$menu"
 check grep -q 'www.example.com.*API/超时/证书/TLS1.3' <<< "$menu"
 _warn() { :; }
 remote_fixture=$'20\t1\tBeijing/Test\tTLSv1.3\t1\t1\tcomplete'
-menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n3')
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\n3\nY')
 reject grep -q '中国远程复测候选 TOP' <<< "$menu"
 reject grep -q '优先复测候选' <<< "$menu"
 
 # Local-only failures must not suggest a Globalping problem.
 _warn() { printf 'WARN: %s\n' "$*"; }
-menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n1')
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\n1\nY')
 check grep -q '本轮仅执行 VPS 本地测试' <<< "$menu"
 reject grep -q '检查出发点、Globalping' <<< "$menu"
 reject grep -q '中国远程探测:' <<< "$menu"
 
 # Remote-only failures must not claim that VPS local validation ran.
 remote_fixture=''
-menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n2')
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\n2')
 check grep -q '中国远程探测: 1/1 个候选已尝试，0 个完整覆盖，0 个部分覆盖，1 个无有效结果' <<< "$menu"
 reject grep -q 'VPS 本地严格校验:' <<< "$menu"
 
@@ -295,7 +295,7 @@ _sni_globalping_http() {
         *) return 1 ;;
     esac
 }
-menu=$(_sni_optimizer_menu <<< $'5\none.example.com two.example.com three.example.com\nY\n3')
+menu=$(_sni_optimizer_menu <<< $'5\none.example.com two.example.com three.example.com\n3\nY')
 check grep -q '综合结果 TOP' <<< "$menu"
 check grep -q 'two.example.com.*HTTP 2xx 0/1' <<< "$menu"
 check grep -q 'three.example.com.*API/超时/证书/TLS1.3' <<< "$menu"
@@ -313,7 +313,7 @@ _sni_globalping_http() {
     esac
 }
 sg_pool='www.singaporeair.com www.dbs.com.sg www.sgx.com www.singtel.com www.starhub.com www.uob.com.sg www.capitaland.com www.grab.com'
-menu=$(_sni_optimizer_menu <<< "$(printf '5\n%s\nY\n2\n' "$sg_pool")")
+menu=$(_sni_optimizer_menu <<< "$(printf '5\n%s\n2\n' "$sg_pool")")
 check grep -q '中国远程探测: 5/8 个候选已尝试，0 个完整覆盖，3 个部分覆盖，2 个无有效结果' <<< "$menu"
 check grep -q 'www.singtel.com.*HTTP 2xx 2/3.*TLS1.3 2/3.*覆盖=partial-fallback' <<< "$menu"
 check grep -q 'www.dbs.com.sg.*API/超时/证书/TLS1.3' <<< "$menu"
@@ -325,7 +325,7 @@ check grep -q 'www.singtel.com' <<< "$first_diagnostic"
 
 # A high-latency sole survivor is not advertised as an optimal choice.
 _sni_test_domain() { printf '573\t25\t✓\t3\t45.60.35.24\n'; }
-menu=$(_sni_optimizer_menu <<< $'5\nslow.example.com\nY\n1')
+menu=$(_sni_optimizer_menu <<< $'5\nslow.example.com\n1\nY')
 check grep -q '仅 1 个候选进入本轮排名' <<< "$menu"
 check grep -q 'slow.example.com.*573ms.*高延迟，暂不建议优先使用' <<< "$menu"
 reject grep -q '本轮复测候选' <<< "$menu"
@@ -333,7 +333,7 @@ reject grep -q '本轮复测候选' <<< "$menu"
 # No candidate HTTP measurements for local failures or CDN exclusions.
 _sni_globalping_http() { printf 'called\n' >> "$task_tmp/remote-calls"; return 1; }
 mock_org='Cloudflare Inc'
-menu=$(_sni_optimizer_menu <<< $'5\ncdn.example.com\nY\n3')
+menu=$(_sni_optimizer_menu <<< $'5\ncdn.example.com\n3\nY')
 reject test -e "$task_tmp/remote-calls"
 check grep -q '本地淘汰项未重复发起远程请求' <<< "$menu"
 mock_org=hosting
@@ -348,27 +348,22 @@ _sni_globalping_http() {
     printf '%s\n' "$1" >> "$task_tmp/mixed-remote-calls"
     printf '20\t1\tBeijing/Test\tTLSv1.3\t1\t1\tcomplete\t1\n'
 }
-menu=$(_sni_optimizer_menu <<< $'5\nbad.example.com good.example.com\nY\n3')
+menu=$(_sni_optimizer_menu <<< $'5\nbad.example.com good.example.com\n3\nY')
 check test "$(<"$task_tmp/mixed-remote-calls")" = good.example.com
 check grep -q 'VPS 本地通过 1/2' <<< "$menu"
 
-# The media source obeys the same TLS and CDN exclusion gates.
-_sni_test_domain() {
-    [ "$1" != blog.codinghorror.com ] || return 1
-    printf '20\t0\t✓\t3\t45.60.35.24\n'
-}
+# Removed sources cannot accidentally start a test.
+for removed_source in 6 7; do
+    menu=$(_sni_optimizer_menu <<< "$removed_source")
+    reject grep -q '本轮 .* 个候选' <<< "$menu"
+done
+_sni_test_domain() { printf '20\t0\t✓\t3\t45.60.35.24\n'; }
 mock_org='Cloudflare Inc'
-_sni_globalping_http() { printf 'called\n' >> "$task_tmp/media-remote-calls"; return 1; }
-menu=$(_sni_optimizer_menu <<< $'7\nY\n3')
-check grep -q '本轮 8 个候选' <<< "$menu"
-check grep -q 'blog.codinghorror.com.*未通过严格校验' <<< "$menu"
-check grep -q '7 个因 CDN/WAF 策略排除' <<< "$menu"
-reject test -e "$task_tmp/media-remote-calls"
 
 # Advance the menu clock after one exclusion; remaining entries are untested,
 # not failures. No sleeps or real network requests are needed.
 _warn() { case "$*" in *'检测到 CDN/WAF，按本次策略排除。'*) SECONDS=$SNI_LOCAL_DEADLINE ;; esac; }
-menu=$(_sni_optimizer_menu <<< $'5\ncdn.example.com untested.example.com\nY\n1')
+menu=$(_sni_optimizer_menu <<< $'5\ncdn.example.com untested.example.com\n1\nY')
 check grep -q 'untested.example.com.*未测试：本轮时间预算耗尽' <<< "$menu"
 check grep -q '因本地时间预算未测试或未完成: 1 个' <<< "$menu"
 check grep -q '0/2 通过，0 个未通过' <<< "$menu"
@@ -388,13 +383,25 @@ _province_test_menu() {
     SNI_PROVINCE_REPORT='电信 TCP 成功 3/3；联通 TCP 成功 3/3；移动 TCP 成功 3/3'
 }
 _sni_globalping_http() { echo unexpected-globalping; return 1; }
-menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n\n')
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\n\n')
 check grep -q 'VPS → 河北 三网 IPv4 参考结果' <<< "$menu"
 check grep -q '本轮没有可直接应用的 SNI 候选' <<< "$menu"
 reject grep -q 'unexpected-globalping' <<< "$menu"
 _sni_test_domain() { printf '20\t0\t✓\t3\t45.60.35.24\n'; }
-menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\nY\n4')
+menu=$(_sni_optimizer_menu <<< $'5\nwww.example.com\n4')
 check grep -q 'VPS → 河北 三网 IPv4 参考结果' <<< "$menu"
 check grep -q 'VPS 侧候选结果 TOP' <<< "$menu"
 reject grep -q '综合结果 TOP' <<< "$menu"
+
+# Defaults are auto-region + province reference, with no CDN prompt required.
+curl() { printf 'SG\n'; }
+menu=$(_sni_optimizer_menu <<< $'\n\n')
+check grep -q '本轮 15 个候选' <<< "$menu"
+check grep -q 'VPS → 河北 三网 IPv4 参考结果' <<< "$menu"
+reject grep -q 'unexpected-globalping' <<< "$menu"
+reject grep -q '\[6\]\|\[7\]' <<< "$menu"
+mock_org='Cloudflare Inc'
+menu=$(_sni_optimizer_menu <<< $'4\n4')
+check grep -q '15 个因 CDN/WAF 策略排除' <<< "$menu"
+reject grep -q '候选结果 TOP' <<< "$menu"
 printf 'PASS: %s checks (mocked network and config writes)\n' "$tests"

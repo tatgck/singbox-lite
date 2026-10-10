@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="32"
+export SCRIPT_VERSION="33"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -5486,6 +5486,7 @@ _modify_sni() {
     sni_pending=false
     rm -rf "$sni_state_dir"
     _success "SNI 修改成功，服务已重新加载: ${old_sni} -> ${new_sni}"
+    _info "请在客户端更新订阅或重新导入下方链接；已导入节点的 SNI 不会随服务端自动更新。"
 
     local updated_link=$(jq -r --arg t "$tag_to_modify" '.[$t].share_link // ""' "$METADATA_FILE" 2>/dev/null)
     if [ -n "$updated_link" ]; then
@@ -5960,13 +5961,13 @@ _province_test_endpoint() {
         if [ "$rc" -eq 0 ] && [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && _sni_public_ipv4 "$ip"; then
             http_ok=$((http_ok + 1))
         fi
-        rounds="${rounds}${rounds:+；}第${r}轮 HTTP=${code:-000}/curl=${rc}"
+        rounds="${rounds}${rounds:+$'\n'}第${r}轮 HTTP=${code:-000}/curl=${rc}"
     done
     if [ "$tcp_ok" -gt 0 ]; then
-        printf 'TCP 成功 %s/3，建连均值 %sms，范围 %s–%sms；HTTP 响应 %s/3；实际 IPv4: %s；%s\n' \
+        printf 'TCP 成功 %s/3，建连均值 %sms，范围 %s–%sms\nHTTP 响应 %s/3\n实际 IPv4: %s\n%s\n' \
             "$tcp_ok" "$((sum / tcp_ok))" "$min" "$max" "$http_ok" "$ips" "$rounds"
     else
-        printf 'TCP 成功 0/3，建连耗时不可用；HTTP 响应 %s/3；%s\n' "$http_ok" "$rounds"
+        printf 'TCP 成功 0/3，建连耗时不可用\nHTTP 响应 %s/3\n实际 IPv4: 未建立公网 IPv4 连接\n%s\n' "$http_ok" "$rounds"
     fi
 }
 
@@ -6003,13 +6004,15 @@ _province_test_menu() {
     [ -n "$selected" ] || { _warn '省份无效，本轮取消；一次只选一个省。'; return 1; }
     IFS='|' read -r name code <<< "$selected"
     SNI_PROVINCE_NAME="$name"
+    idx=1
     for carrier in ct cu cm; do
         case "$carrier" in ct) name=电信 ;; cu) name=联通 ;; cm) name=移动 ;; esac
         host="${code}-${carrier}-v4.ip.zstaticcdn.com"
         printf '  测试 %s %s:80（最多 15 秒）...\n' "$name" "$host"
         result=$(_province_test_endpoint "$host") || result='未取得测试结果'
-        printf '    %s\n' "$result"
-        SNI_PROVINCE_REPORT="${SNI_PROVINCE_REPORT}${SNI_PROVINCE_REPORT:+$'\n'}${name} ${host}:80  ${result}"
+        # Keep progress short; render one numbered list after all three tests.
+        SNI_PROVINCE_REPORT="${SNI_PROVINCE_REPORT}${SNI_PROVINCE_REPORT:+$'\n\n'}${idx}. ${name}"$'\n'"   ${host}:80"$'\n'"$(printf '%s\n' "$result" | sed 's/^/   /')"
+        idx=$((idx + 1))
     done
     _province_print_report
 }
@@ -6033,8 +6036,6 @@ _sni_optimizer_menu() {
     local pool_gb="www.arm.com www.dyson.co.uk www.tesco.com www.bt.com www.burberry.com"
     # Unverified global seeds may resolve to CDN edges; apply the same checks.
     local pool_global="swdist.apple.com updates.cdn-apple.com gateway.icloud.com itunes.apple.com aws.amazon.com www.amd.com www.cisco.com addons.mozilla.org"
-    # Content variety is a discovery aid, never proof of origin locality or TLS suitability.
-    local pool_media="blog.codinghorror.com www.joelonsoftware.com kottke.org www.thisiscolossal.com code.blender.org www.blender.org www.arte.tv www.bfi.org.uk"
 
     clear
     echo -e "${CYAN}"
@@ -6049,19 +6050,17 @@ _sni_optimizer_menu() {
     _warn "中国远程模式使用公开探针，结果用于线路筛选；正式使用前仍建议从实际客户端复测。"
     _warn "适用于 VLESS-Reality/Any-Reality。普通 AnyTLS 请使用证书覆盖的自有域名；第三方 SNI 不等于可信伪装。"
     echo ""
+    echo -e "    ${GREEN}[4]${NC} 自动检测当前服务器所在地区（默认，直接回车）"
     echo -e "    ${GREEN}[1]${NC} 美国 (US)"
     echo -e "    ${GREEN}[2]${NC} 日本 (JP)"
     echo -e "    ${GREEN}[3]${NC} 新加坡 (SG)"
-    echo -e "    ${GREEN}[4]${NC} 自动检测当前服务器所在地区"
-    echo -e "    ${GREEN}[5]${NC} 自定义候选域名（默认，最多 32 个）"
-    echo -e "    ${GREEN}[6]${NC} 从本地文件读取候选域名（每行一个）"
-    echo -e "    ${GREEN}[7]${NC} 博客／图文／视频站种子（跨地区，仍需严格验证）"
+    echo -e "    ${GREEN}[5]${NC} 自定义候选域名（最多 32 个）"
     echo ""
     echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
     echo ""
     local region_choice
-    read -r -p "  请选择候选来源 [0-7，默认 5]: " region_choice || return
-    region_choice=${region_choice:-5}
+    read -r -p "  请选择候选来源 [0-5，默认 4]: " region_choice || return
+    region_choice=${region_choice:-4}
 
     local pool=""
     local region_name=""
@@ -6072,14 +6071,14 @@ _sni_optimizer_menu() {
     local source_selected_count=0
     local source_carrier_count=0
     local source_label=""
-    local candidate_input candidate_file
+    local candidate_input
     case "$region_choice" in
         1) pool="$pool_us"; region_name="美国" ;;
         2) pool="$pool_jp"; region_name="日本" ;;
         3) pool="$pool_sg"; region_name="新加坡" ;;
         4)
             _info "正在检测服务器所在地区..."
-            local country=$(curl -q -s -m 5 https://ipinfo.io/country 2>/dev/null | tr -d ' \n\r')
+            local country=$(curl -q --noproxy '*' -4 -fsS --connect-timeout 3 --max-time 5 https://ipinfo.io/country 2>/dev/null | tr -d ' \n\r')
             case "$country" in
                 US) pool="$pool_us"; region_name="美国 (US)" ;;
                 JP) pool="$pool_jp"; region_name="日本 (JP)" ;;
@@ -6099,43 +6098,32 @@ _sni_optimizer_menu() {
             pool=$(_sni_parse_candidates "$candidate_input") || return 1
             region_name="自定义候选"
             ;;
-        6)
-            read -r -p "候选文件绝对路径（每行一个域名，最多 32 个，无 URL/注释）: " candidate_file || return
-            if [ ! -f "$candidate_file" ] || [ ! -r "$candidate_file" ] ||
-               [ "$(wc -c < "$candidate_file")" -gt 16384 ]; then
-                _warn "文件不存在、不可读或大于 16KB。"; return 1
-            fi
-            candidate_input=$(<"$candidate_file")
-            pool=$(_sni_parse_candidates "$candidate_input") || return 1
-            region_name="文件候选"
-            ;;
-        7)
-            pool="$pool_media"; region_name="博客／图文／视频站（跨地区种子）"
-            _info '内容类型不保证低延迟或隐蔽性；只测首页 HEAD，不下载媒体，默认 CDN 排除策略仍生效。'
-            ;;
         *) return ;;
     esac
 
-    local exclude_cdn
-    read -r -p "排除检测到的 CDN/WAF 候选？[Y/n，默认 Y]: " exclude_cdn || return
-    exclude_cdn=${exclude_cdn:-Y}
+    local exclude_cdn=Y
+    echo ""
+    echo -e "    ${GREEN}[4]${NC} VPS 本地 SNI + 一个省三网 IPv4 参考（默认，直接回车）"
+    echo -e "    ${GREEN}[1]${NC} 仅测试当前 VPS"
+    echo -e "    ${GREEN}[3]${NC} VPS + 中国远程出发点（进阶，依赖探针覆盖）"
+    echo -e "    ${GREEN}[2]${NC} 仅测试中国远程出发点（诊断，不作本地推荐）"
+    read -r -p "  请选择测试方式 [1-4，默认 4]: " test_mode || return
+    test_mode=${test_mode:-4}
+    case "$test_mode" in
+        1|3)
+            read -r -p "排除检测到的 CDN/WAF 候选？[Y/n，默认 Y]: " exclude_cdn || return
+            exclude_cdn=${exclude_cdn:-Y}
+            ;;
+        2) ;;
+        4) _info '常用模式：默认排除检测到的 CDN/WAF 候选。' ;;
+        *) _warn "测试方式无效，已取消。"; return 1 ;;
+    esac
     _info "未检测出 CDN 不代表一定是源站；同地域/同 ASN 是参考，不保证隐蔽或不会被封。"
     [ -z "$server_ip" ] && _init_server_ip >/dev/null 2>&1
     local vps_meta=""
     if _sni_public_ipv4 "$server_ip"; then vps_meta=$(_sni_ip_metadata "$server_ip"); fi
     [ -n "$vps_meta" ] && _info "VPS IP 数据库信息（可能不准）: ${vps_meta}"
 
-    echo ""
-    echo -e "    ${GREEN}[1]${NC} 仅测试当前 VPS"
-    echo -e "    ${GREEN}[2]${NC} 仅测试中国远程出发点"
-    echo -e "    ${GREEN}[3]${NC} VPS + 中国远程出发点"
-    echo -e "    ${GREEN}[4]${NC} VPS 本地 SNI + 一个省三网 IPv4 参考（默认）"
-    read -r -p "  请选择测试方式 [1-4，默认 4]: " test_mode || return
-    [ -z "$test_mode" ] && test_mode="4"
-    case "$test_mode" in
-        1|2|3|4) ;;
-        *) _warn "测试方式无效，已取消。"; return 1 ;;
-    esac
     if [ "$test_mode" = 4 ]; then
         _province_test_menu || return 1
         test_mode=1

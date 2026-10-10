@@ -58,6 +58,11 @@ menu=$(_province_test_menu <<< '河北')
 after=$(wc -l < "$task_tmp/calls")
 check test "$((after-before))" = 9
 check grep -q 'VPS → 河北 三网 IPv4 参考结果' <<< "$menu"
+check grep -q '^1\. 电信$' <<< "$menu"
+check grep -q '^2\. 联通$' <<< "$menu"
+check grep -q '^3\. 移动$' <<< "$menu"
+check test "$(grep -c 'TCP 成功' <<< "$menu")" = 3
+check grep -q '^   第3轮 HTTP=200/curl=0$' <<< "$menu"
 for code in ct cu cm; do check grep -q "he-${code}-v4.ip.zstaticcdn.com:80" <<< "$menu"; done
 check test "$(_province_catalog | wc -l | tr -d ' ')" = 31
 check test "$(_province_catalog | cut -d '|' -f2 | sort -u | wc -l | tr -d ' ')" = 31
